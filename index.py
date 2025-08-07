@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 import json
 import os
+from numpy import tile
 
 # Difficulty settings
 DIFFICULTIES = {
@@ -290,7 +291,8 @@ class Minesweeper:
         self.tk = tk
         self.settings = Settings()
         self.stats = Statistics()
-        
+        self.ai = MinesweeperAI(self)
+
         # Initialize game variables
         self.size_x = DIFFICULTIES[self.settings.difficulty]["size_x"]
         self.size_y = DIFFICULTIES[self.settings.difficulty]["size_y"]
@@ -322,11 +324,11 @@ class Minesweeper:
         self.tk.bind("<F4>", lambda e: self.open_stats())
     
     def setup_ui(self):
-        # Main frame
+        # Main container frame
         self.main_frame = Frame(self.tk)
         self.main_frame.pack(padx=10, pady=10)
         
-        # Top frame for controls
+        # Top frame for status labels
         self.top_frame = Frame(self.main_frame)
         self.top_frame.pack(fill=X, pady=(0, 10))
         
@@ -341,7 +343,7 @@ class Minesweeper:
         self.labels["flags"].pack(side=LEFT, padx=(20, 0))
         self.labels["time"].pack(side=RIGHT)
         
-        # Game frame
+        # Game frame for the minefield
         self.game_frame = Frame(self.main_frame)
         self.game_frame.pack()
         
@@ -349,6 +351,7 @@ class Minesweeper:
         self.bottom_frame = Frame(self.main_frame)
         self.bottom_frame.pack(fill=X, pady=(10, 0))
         
+        # Control buttons
         restart_btn = Button(self.bottom_frame, text="New Game (F2)", command=self.restart, 
                            font=("Arial", 10), padx=10)
         restart_btn.pack(side=LEFT)
@@ -360,6 +363,10 @@ class Minesweeper:
         stats_btn = Button(self.bottom_frame, text="Stats (F4)", command=self.open_stats,
                          font=("Arial", 10), padx=10)
         stats_btn.pack(side=LEFT, padx=(10, 0))
+
+        auto_play_btn = Button(self.bottom_frame, text="Auto Play", command=self.auto_play,
+                               font=("Arial", 10), padx=10)
+        auto_play_btn.pack(side=LEFT, padx=(10, 0))
         
         # Difficulty label
         difficulty_text = f"Difficulty: {self.settings.difficulty}"
@@ -369,6 +376,12 @@ class Minesweeper:
         self.difficulty_label = Label(self.bottom_frame, text=difficulty_text, font=("Arial", 9))
         self.difficulty_label.pack(side=RIGHT)
     
+    def auto_play(self):
+        if self.game_over_flag:
+            return
+        if self.ai.play():
+            self.tk.after(100, self.auto_play)
+
     def apply_theme(self):
         theme = THEMES[self.settings.theme]
         self.tk.configure(bg=theme["bg"])
@@ -383,64 +396,76 @@ class Minesweeper:
         self.difficulty_label.configure(bg=theme["bg"], fg=theme["text_color"])
     
     def create_images(self):
-        # Load actual image files
-        try:
-            self.images = {
-                "plain": PhotoImage(file="images/tile_plain.gif"),
-                "clicked": PhotoImage(file="images/tile_clicked.gif"),
-                "mine": PhotoImage(file="images/tile_mine.gif"),
-                "flag": PhotoImage(file="images/tile_flag.gif"),
-                "wrong": PhotoImage(file="images/tile_wrong.gif"),
-                "numbers": []
-            }
-            
-            # Load numbered tiles
-            for i in range(1, 9):
-                self.images["numbers"].append(PhotoImage(file=f"images/tile_{i}.gif"))
-                
-        except Exception as e:
-            print(f"Warning: Could not load image files: {e}")
-            print("Falling back to basic colored tiles...")
-            # Fallback to simple colored rectangles if images not found
-            self.create_fallback_images()
-    
-    def create_fallback_images(self):
-        # Create simple colored rectangles as fallback
+        """Load images from the images folder, falling back to simple colors if files don't exist"""
         self.images = {
-            "plain": PhotoImage(width=20, height=20),
-            "clicked": PhotoImage(width=20, height=20),
-            "mine": PhotoImage(width=20, height=20),
-            "flag": PhotoImage(width=20, height=20),
-            "wrong": PhotoImage(width=20, height=20),
+            "plain": None,
+            "clicked": None,
+            "mine": None,
+            "flag": None,
+            "wrong": None,
             "numbers": []
         }
         
+        # Try to load actual image files first
+        image_path = "images"
+        image_files = {
+            "plain": "tile_plain.gif",
+            "clicked": "tile_clicked.gif",
+            "mine": "tile_mine.gif",
+            "flag": "tile_flag.gif",
+            "wrong": "tile_wrong.gif"
+        }
+        
+        # Load basic tiles
+        for key, filename in image_files.items():
+            try:
+                filepath = os.path.join(image_path, filename)
+                if os.path.exists(filepath):
+                    self.images[key] = PhotoImage(file=filepath)
+                else:
+                    # Fallback to colored rectangles
+                    self.images[key] = self.create_fallback_image(key)
+            except:
+                self.images[key] = self.create_fallback_image(key)
+        
+        # Load number tiles (1-8)
+        for i in range(1, 9):
+            try:
+                filepath = os.path.join(image_path, f"tile_{i}.gif")
+                if os.path.exists(filepath):
+                    img = PhotoImage(file=filepath)
+                else:
+                    img = self.create_fallback_number_image(i)
+                self.images["numbers"].append(img)
+            except:
+                self.images["numbers"].append(self.create_fallback_number_image(i))
+    
+    def create_fallback_image(self, image_type):
+        """Create fallback colored rectangle images"""
         theme = THEMES[self.settings.theme]
+        img = PhotoImage(width=20, height=20)
         
-        # Plain tile
-        self.images["plain"].put(theme["button_bg"], (0, 0, 20, 20))
-        
-        # Clicked tile
-        self.images["clicked"].put("#ffffff", (0, 0, 20, 20))
-        
-        # Mine tile
-        self.images["mine"].put(theme["mine_color"], (0, 0, 20, 20))
-        
-        # Flag tile
-        self.images["flag"].put(theme["flag_color"], (0, 0, 20, 20))
-        
-        # Wrong flag
-        self.images["wrong"].put("#888888", (0, 0, 20, 20))
-        
-        # Number tiles
-        colors = ["#0000ff", "#008000", "#ff0000", "#800080", "#800000", "#008080", "#000000", "#808080"]
-        for i in range(8):
-            img = PhotoImage(width=20, height=20)
+        if image_type == "plain":
+            img.put(theme["button_bg"], (0, 0, 20, 20))
+        elif image_type == "clicked":
             img.put("#ffffff", (0, 0, 20, 20))
-            self.images["numbers"].append(img)
+        elif image_type == "mine":
+            img.put(theme["mine_color"], (0, 0, 20, 20))
+        elif image_type == "flag":
+            img.put(theme["flag_color"], (0, 0, 20, 20))
+        elif image_type == "wrong":
+            img.put("#888888", (0, 0, 20, 20))
+        
+        return img
+    
+    def create_fallback_number_image(self, number):
+        """Create fallback number images"""
+        img = PhotoImage(width=20, height=20)
+        img.put("#ffffff", (0, 0, 20, 20))
+        return img
     
     def setup(self):
-        # Clear existing game
+        # Clear existing game tiles
         for widget in self.game_frame.winfo_children():
             widget.destroy()
         
@@ -454,8 +479,9 @@ class Minesweeper:
         
         self.create_images()
         
-        # Create tiles
+        # Create tiles using grid layout in the game_frame
         self.tiles = {}
+        
         for x in range(self.size_x):
             self.tiles[x] = {}
             for y in range(self.size_y):
@@ -466,12 +492,12 @@ class Minesweeper:
                     "coords": {"x": x, "y": y},
                     "mines": 0,
                     "button": Button(self.game_frame, image=self.images["plain"], 
-                                   bd=0, highlightthickness=0)
+                                   width=25, height=25, bd=1, relief="raised")
                 }
                 
                 tile["button"].bind(BTN_CLICK, self.on_click_wrapper(x, y))
                 tile["button"].bind(BTN_FLAG, self.on_right_click_wrapper(x, y))
-                tile["button"].grid(row=x, column=y)
+                tile["button"].grid(row=x, column=y, padx=1, pady=1)
                 
                 self.tiles[x][y] = tile
         
@@ -521,6 +547,10 @@ class Minesweeper:
         if self.settings.difficulty == "Custom":
             difficulty_text += f" ({self.size_y}x{self.size_x}, {self.total_mines} mines)"
         self.difficulty_label.config(text=difficulty_text)
+        
+        # Adjust window size to fit the grid
+        self.tk.update_idletasks()
+        self.tk.geometry("")  # Let tkinter calculate the size
     
     def refresh_labels(self):
         self.labels["flags"].config(text=f"Flags: {self.flag_count}")
@@ -565,7 +595,7 @@ class Minesweeper:
         else:
             self.labels["time"].config(text="")
         
-        self.main_frame.after(100, self.update_timer)
+        self.tk.after(100, self.update_timer)
     
     def get_neighbors(self, x, y):
         neighbors = []
@@ -604,10 +634,11 @@ class Minesweeper:
         
         # Reveal tile
         if tile["mines"] == 0:
-            tile["button"].config(image=self.images["clicked"])
+            tile["button"].config(image=self.images["clicked"], relief="sunken")
             self.clear_surrounding_tiles(tile["id"])
         else:
-            tile["button"].config(image=self.images["numbers"][tile["mines"] - 1])
+            tile["button"].config(image=self.images["numbers"][tile["mines"] - 1], relief="sunken")
+            self.check_auto_open_neighbors(tile)
         
         if tile["state"] != STATE_CLICKED:
             tile["state"] = STATE_CLICKED
@@ -616,6 +647,17 @@ class Minesweeper:
         # Check win condition
         if self.clicked_count == (self.size_x * self.size_y) - self.total_mines:
             self.game_over(True)
+
+    def check_auto_open_neighbors(self, tile):
+        x, y = tile["coords"]["x"], tile["coords"]["y"]
+        neighbors = self.get_neighbors(x, y)
+        flag_count = sum(1 for n in neighbors if n["state"] == STATE_FLAGGED)
+
+        if flag_count == tile["mines"]:
+            for n in neighbors:
+                if n["state"] == STATE_DEFAULT:
+                    self.on_click(n)
+
     
     def on_right_click(self, tile):
         if self.game_over_flag or tile["state"] == STATE_CLICKED:
@@ -660,10 +702,10 @@ class Minesweeper:
             return
         
         if tile["mines"] == 0:
-            tile["button"].config(image=self.images["clicked"])
+            tile["button"].config(image=self.images["clicked"], relief="sunken")
             queue.append(tile["id"])
         else:
-            tile["button"].config(image=self.images["numbers"][tile["mines"] - 1])
+            tile["button"].config(image=self.images["numbers"][tile["mines"] - 1], relief="sunken")
         
         tile["state"] = STATE_CLICKED
         self.clicked_count += 1
@@ -677,6 +719,26 @@ class Minesweeper:
     
     def open_stats(self):
         StatsWindow(self.tk, self.stats)
+
+
+class MinesweeperAI:
+    def __init__(self, game):
+        self.game = game
+        self.actions_taken = []
+
+    def play(self):
+        """AI tự động đưa ra hành động"""
+        # Ví dụ đơn giản: chọn 1 ô chưa mở và chưa flag, rồi click
+        for x in range(self.game.size_x):
+            for y in range(self.game.size_y):
+                tile = self.game.tiles[x][y]
+                if tile["state"] == STATE_DEFAULT:
+                    self.game.on_click(tile)
+                    self.actions_taken.append(("click", x, y))
+                    return  # chỉ thực hiện 1 hành động mỗi lần gọi
+
+    def reset(self):
+        self.actions_taken = []
 
 def main():
     # Create main window
