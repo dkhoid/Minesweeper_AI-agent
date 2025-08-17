@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 import json
 import os
-from numpy import tile
+from abc import ABC, abstractmethod
 
 # Difficulty settings
 DIFFICULTIES = {
@@ -16,6 +16,732 @@ DIFFICULTIES = {
     "Intermediate": {"size_x": 16, "size_y": 16, "mines": 40},
     "Expert": {"size_x": 16, "size_y": 30, "mines": 99},
     "Custom": {"size_x": 10, "size_y": 10, "mines": 15}
+}
+class AIStrategy(ABC):
+    @abstractmethod
+    def next_move(self, game):
+        # return ('click', 0, 0)  # Default action, should be overridden by subclasses
+        pass
+
+class MinesweeperAI:
+    def __init__(self, game, strategy: AIStrategy):
+        self.game = game
+        self.strategy = strategy
+        self.actions_taken = []
+
+    def set_strategy(self, strategy):
+        """Set a new strategy for the AI."""
+        self.strategy = strategy
+        self.actions_taken.clear()
+
+    def play(self):
+        """Execute the next move based on the current strategy."""
+        if not self.strategy:
+            return False
+            
+        move = self.strategy.next_move(self.game)
+        if move:
+            action, x, y = move
+            if action == 'click':
+                self.game.on_click(self.game.tiles[x][y])
+            elif action == 'flag':
+                self.game.on_right_click(self.game.tiles[x][y])
+            self.actions_taken.append(move)
+            return True
+        return False        
+
+    def reset(self):
+        self.actions_taken = []
+
+class RandomStrategy(AIStrategy):
+    def next_move(self, game):
+        # Randomly select a tile to click
+        unclicked_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
+                           if game.tiles[x][y]["state"] == STATE_DEFAULT]
+        if unclicked_tiles:
+            x, y = random.choice(unclicked_tiles)
+            return ('click', x, y)
+        return None
+
+class AutoOpenStrategy(AIStrategy):
+    def next_move(self, game):
+        # Tìm ô số đã mở, đủ flag quanh nó
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                t = game.tiles[x][y]
+                if t["state"] == STATE_CLICKED and t["mines"] > 0:
+                    neigh = game.get_neighbors(x, y)
+                    flag_cnt = sum(1 for n in neigh if n["state"] == STATE_FLAGGED)
+                    if flag_cnt == t["mines"]:
+                        # mở các ô chưa mở quanh nó
+                        for n in neigh:
+                            if n["state"] == STATE_DEFAULT:
+                                return ("click", n["coords"]["x"], n["coords"]["y"])
+        
+        # If no auto-open moves available, try to flag obvious mines
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                t = game.tiles[x][y]
+                if t["state"] == STATE_CLICKED and t["mines"] > 0:
+                    neigh = game.get_neighbors(x, y)
+                    unflagged_default = [n for n in neigh if n["state"] == STATE_DEFAULT]
+                    flagged_count = sum(1 for n in neigh if n["state"] == STATE_FLAGGED)
+                    
+                    # If remaining unflagged tiles equals remaining mines, flag them all
+                    if len(unflagged_default) > 0 and len(unflagged_default) == (t["mines"] - flagged_count):
+                        n = unflagged_default[0]
+                        return ("flag", n["coords"]["x"], n["coords"]["y"])
+        
+        # If no strategic moves, make a random safe click
+        unclicked_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
+                           if game.tiles[x][y]["state"] == STATE_DEFAULT]
+        if unclicked_tiles:
+            x, y = random.choice(unclicked_tiles)
+            return ('click', x, y)
+        
+        return None
+
+class ProbabilisticStrategy(AIStrategy):
+    def next_move(self, game):
+        prob_map = {}  # (x,y) -> estimated mine probability
+
+        # 1. Duyệt qua tất cả ô số đã mở
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                t = game.tiles[x][y]
+                if t["state"] == STATE_CLICKED and t["mines"] > 0:
+                    neigh = game.get_neighbors(x, y)
+                    unflagged_default = [n for n in neigh if n["state"] == STATE_DEFAULT]
+                    flagged_count = sum(1 for n in neigh if n["state"] == STATE_FLAGGED)
+
+                    remaining_mines = t["mines"] - flagged_count
+                    if len(unflagged_default) > 0 and remaining_mines >= 0:
+                        p = remaining_mines / len(unflagged_default)
+
+                        # cập nhật xác suất cho từng ô
+                        for n in unflagged_default:
+                            coord = (n["coords"]["x"], n["coords"]["y"])
+                            if coord not in prob_map:
+                                prob_map[coord] = []
+                            prob_map[coord].append(p)
+
+        # 2. Gom xác suất lại (lấy max hoặc trung bình)
+        final_probs = {}
+        for coord, probs in prob_map.items():
+            # final_probs[coord] = max(probs)   # conservative
+            final_probs[coord] = sum(probs)/len(probs)  # average
+
+        if not final_probs:
+            # Nếu không có constraint nào, random
+            unclicked = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
+                         if game.tiles[x][y]["state"] == STATE_DEFAULT]
+            if unclicked:
+                return ("click", *random.choice(unclicked))
+            return None
+
+        # 3. Tìm nước đi tốt nhất
+        safe_moves = [c for c, p in final_probs.items() if p == 0]
+        if safe_moves:
+            x, y = safe_moves[0]
+            return ("click", x, y)
+
+        sure_flags = [c for c, p in final_probs.items() if p == 1]
+        if sure_flags:
+            x, y = sure_flags[0]
+            return ("flag", x, y)
+
+        # 4. Nếu không có chắc chắn: chọn ô ít nguy hiểm nhất
+        best_coord = min(final_probs.items(), key=lambda kv: kv[1])[0]
+        return ("click", best_coord[0], best_coord[1])
+
+class CSPStrategy(AIStrategy):
+    def next_move(self, game):
+        # Collect all constraints from numbered tiles
+        constraints = []
+        variables = set()  # All unknown tiles
+        
+        # Find all unknown tiles
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                if game.tiles[x][y]["state"] == STATE_DEFAULT:
+                    variables.add((x, y))
+        
+        if not variables:
+            return None
+        
+        # Build constraints from numbered tiles
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+                if tile["state"] == STATE_CLICKED and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    unknown_neighbors = []
+                    flagged_count = 0
+                    
+                    for n in neighbors:
+                        if n["state"] == STATE_DEFAULT:
+                            unknown_neighbors.append((n["coords"]["x"], n["coords"]["y"]))
+                        elif n["state"] == STATE_FLAGGED:
+                            flagged_count += 1
+                    
+                    if unknown_neighbors:
+                        remaining_mines = tile["mines"] - flagged_count
+                        constraints.append((unknown_neighbors, remaining_mines))
+        
+        if not constraints:
+            # No constraints, random move
+            return ("click", *random.choice(list(variables)))
+        
+        # Solve CSP using constraint propagation and backtracking
+        solution = self.solve_csp(variables, constraints)
+        
+        if solution:
+            # Find definite mines and safe tiles
+            mines = [var for var, is_mine in solution.items() if is_mine]
+            safe_tiles = [var for var, is_mine in solution.items() if not is_mine]
+            
+            # Flag a mine if found
+            if mines:
+                x, y = mines[0]
+                return ("flag", x, y)
+            
+            # Click a safe tile if found
+            if safe_tiles:
+                x, y = safe_tiles[0]
+                return ("click", x, y)
+        
+        # If CSP can't determine anything definitive, use probability
+        return self.fallback_probabilistic(game, constraints, variables)
+    
+    def solve_csp(self, variables, constraints):
+        """Solve CSP using constraint propagation and backtracking"""
+        assignment = {}
+        
+        # Try constraint propagation first
+        if self.constraint_propagation(variables, constraints, assignment):
+            return assignment
+        
+        # If propagation isn't enough, try backtracking on a subset
+        # (limit to prevent too much computation)
+        if len(variables) <= 20:  # Only for small problems
+            return self.backtrack_search(variables, constraints, assignment)
+        
+        return None
+    
+    def constraint_propagation(self, variables, constraints, assignment):
+        """Apply constraint propagation to find forced assignments"""
+        changed = True
+        while changed:
+            changed = False
+            
+            for constraint_vars, target_mines in constraints:
+                # Filter to unassigned variables in this constraint
+                unassigned = [v for v in constraint_vars if v not in assignment]
+                assigned_mines = sum(1 for v in constraint_vars 
+                                   if v in assignment and assignment[v])
+                
+                remaining_mines = target_mines - assigned_mines
+                
+                # If remaining mines == 0, all unassigned must be safe
+                if remaining_mines == 0:
+                    for var in unassigned:
+                        if var not in assignment:
+                            assignment[var] = False
+                            changed = True
+                
+                # If remaining mines == unassigned count, all must be mines
+                elif remaining_mines == len(unassigned):
+                    for var in unassigned:
+                        if var not in assignment:
+                            assignment[var] = True
+                            changed = True
+        
+        return len(assignment) > 0
+    
+    def backtrack_search(self, variables, constraints, assignment):
+        """Backtracking search for CSP solution"""
+        if len(assignment) == len(variables):
+            return assignment if self.is_consistent(constraints, assignment) else None
+        
+        # Choose next variable (simple heuristic: first unassigned)
+        var = next(v for v in variables if v not in assignment)
+        
+        # Try both values: mine and safe
+        for value in [True, False]:
+            assignment[var] = value
+            if self.is_consistent_partial(constraints, assignment):
+                result = self.backtrack_search(variables, constraints, assignment)
+                if result is not None:
+                    return result
+            del assignment[var]
+        
+        return None
+    
+    def is_consistent_partial(self, constraints, assignment):
+        """Check if partial assignment is consistent with constraints"""
+        for constraint_vars, target_mines in constraints:
+            assigned_mines = sum(1 for v in constraint_vars 
+                               if v in assignment and assignment[v])
+            unassigned_count = sum(1 for v in constraint_vars if v not in assignment)
+            
+            # Too many mines already assigned
+            if assigned_mines > target_mines:
+                return False
+            
+            # Not enough unassigned variables to reach target
+            if assigned_mines + unassigned_count < target_mines:
+                return False
+        
+        return True
+    
+    def is_consistent(self, constraints, assignment):
+        """Check if complete assignment satisfies all constraints"""
+        for constraint_vars, target_mines in constraints:
+            actual_mines = sum(1 for v in constraint_vars 
+                             if assignment.get(v, False))
+            if actual_mines != target_mines:
+                return False
+        return True
+    
+    def fallback_probabilistic(self, game, constraints, variables):
+        """Fallback to probabilistic reasoning when CSP is inconclusive"""
+        prob_map = {}
+        
+        for constraint_vars, target_mines in constraints:
+            unassigned = [v for v in constraint_vars 
+                         if game.tiles[v[0]][v[1]]["state"] == STATE_DEFAULT]
+            
+            if len(unassigned) > 0:
+                prob = target_mines / len(unassigned)
+                for var in unassigned:
+                    if var not in prob_map:
+                        prob_map[var] = []
+                    prob_map[var].append(prob)
+        
+        if prob_map:
+            # Average probabilities
+            final_probs = {var: sum(probs)/len(probs) 
+                          for var, probs in prob_map.items()}
+            
+            # Choose lowest probability tile
+            best_var = min(final_probs.items(), key=lambda x: x[1])[0]
+            return ("click", best_var[0], best_var[1])
+        
+        # Complete fallback to random
+        return ("click", *random.choice(list(variables)))
+
+class HybridStrategy(AIStrategy):
+    def __init__(self):
+        self.move_count = 0
+        self.last_progress = 0
+        self.stuck_count = 0
+    
+    def next_move(self, game):
+        self.move_count += 1
+        
+        # Phase 1: Deterministic moves (highest priority)
+        deterministic_move = self.find_deterministic_move(game)
+        if deterministic_move:
+            self.stuck_count = 0
+            return deterministic_move
+        
+        # Phase 2: CSP solving for complex patterns
+        csp_move = self.solve_with_csp(game)
+        if csp_move:
+            self.stuck_count = 0
+            return csp_move
+        
+        # Phase 3: Advanced probabilistic reasoning
+        prob_move = self.advanced_probabilistic_move(game)
+        if prob_move:
+            return prob_move
+        
+        # Phase 4: Pattern recognition for common scenarios
+        pattern_move = self.pattern_recognition_move(game)
+        if pattern_move:
+            return pattern_move
+        
+        # Phase 5: Strategic random (avoid obvious bad moves)
+        return self.strategic_random_move(game)
+    
+    def find_deterministic_move(self, game):
+        """Find 100% certain moves using basic logical rules"""
+        # Check for auto-open opportunities (flagged neighbors match mine count)
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+                if tile["state"] == STATE_CLICKED and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    flagged_count = sum(1 for n in neighbors if n["state"] == STATE_FLAGGED)
+                    unflagged = [n for n in neighbors if n["state"] == STATE_DEFAULT]
+                    
+                    # Safe click: all mines are already flagged
+                    if flagged_count == tile["mines"] and unflagged:
+                        n = unflagged[0]
+                        return ("click", n["coords"]["x"], n["coords"]["y"])
+                    
+                    # Sure flag: remaining unflagged tiles must all be mines
+                    remaining_mines = tile["mines"] - flagged_count
+                    if remaining_mines > 0 and len(unflagged) == remaining_mines:
+                        n = unflagged[0]
+                        return ("flag", n["coords"]["x"], n["coords"]["y"])
+        
+        return None
+    
+    def solve_with_csp(self, game):
+        """Advanced CSP solving with multiple techniques"""
+        constraints = self.build_constraints(game)
+        variables = self.get_unknown_variables(game)
+        
+        if not constraints or not variables:
+            return None
+        
+        # Try constraint propagation first
+        definite_assignments = self.advanced_constraint_propagation(constraints, variables)
+        
+        if definite_assignments:
+            for var, is_mine in definite_assignments.items():
+                if is_mine:
+                    return ("flag", var[0], var[1])
+                else:
+                    return ("click", var[0], var[1])
+        
+        # Try smaller CSP problems with backtracking
+        if len(variables) <= 25:
+            solution = self.solve_csp_subset(variables, constraints)
+            if solution:
+                mines = [var for var, is_mine in solution.items() if is_mine]
+                safe = [var for var, is_mine in solution.items() if not is_mine]
+                
+                if mines:
+                    return ("flag", mines[0][0], mines[0][1])
+                if safe:
+                    return ("click", safe[0][0], safe[0][1])
+        
+        return None
+    
+    def build_constraints(self, game):
+        """Build constraint system from game state"""
+        constraints = []
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+                if tile["state"] == STATE_CLICKED and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    unknown_neighbors = []
+                    flagged_count = 0
+                    
+                    for n in neighbors:
+                        if n["state"] == STATE_DEFAULT:
+                            unknown_neighbors.append((n["coords"]["x"], n["coords"]["y"]))
+                        elif n["state"] == STATE_FLAGGED:
+                            flagged_count += 1
+                    
+                    if unknown_neighbors:
+                        remaining_mines = tile["mines"] - flagged_count
+                        constraints.append((unknown_neighbors, remaining_mines))
+        
+        return constraints
+    
+    def get_unknown_variables(self, game):
+        """Get all unknown tile positions"""
+        variables = set()
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                if game.tiles[x][y]["state"] == STATE_DEFAULT:
+                    variables.add((x, y))
+        return variables
+    
+    def advanced_constraint_propagation(self, constraints, variables):
+        """Advanced constraint propagation with conflict detection"""
+        assignment = {}
+        changed = True
+        
+        while changed:
+            changed = False
+            
+            for constraint_vars, target_mines in constraints:
+                unassigned = [v for v in constraint_vars if v not in assignment]
+                assigned_mines = sum(1 for v in constraint_vars 
+                                   if v in assignment and assignment[v])
+                
+                remaining_mines = target_mines - assigned_mines
+                
+                # All remaining must be safe
+                if remaining_mines == 0:
+                    for var in unassigned:
+                        if var not in assignment:
+                            assignment[var] = False
+                            changed = True
+                
+                # All remaining must be mines
+                elif remaining_mines == len(unassigned) and remaining_mines > 0:
+                    for var in unassigned:
+                        if var not in assignment:
+                            assignment[var] = True
+                            changed = True
+            
+            # Cross-constraint analysis
+            if not changed:
+                changed = self.cross_constraint_analysis(constraints, assignment)
+        
+        return assignment
+    
+    def cross_constraint_analysis(self, constraints, assignment):
+        """Analyze interactions between multiple constraints"""
+        # Find overlapping constraints
+        for i, (vars1, mines1) in enumerate(constraints):
+            for j, (vars2, mines2) in enumerate(constraints[i+1:], i+1):
+                overlap = set(vars1) & set(vars2)
+                if overlap:
+                    # Try subset reasoning
+                    if set(vars1) <= set(vars2):
+                        # vars1 is subset of vars2
+                        remaining_vars = [v for v in vars2 if v not in vars1]
+                        if remaining_vars:
+                            mines_in_remaining = mines2 - mines1
+                            if mines_in_remaining == 0:
+                                for var in remaining_vars:
+                                    if var not in assignment:
+                                        assignment[var] = False
+                                        return True
+                            elif mines_in_remaining == len(remaining_vars):
+                                for var in remaining_vars:
+                                    if var not in assignment:
+                                        assignment[var] = True
+                                        return True
+        return False
+    
+    def solve_csp_subset(self, variables, constraints):
+        """Solve smaller CSP problems with backtracking"""
+        if len(variables) > 25:
+            # Focus on most constrained variables
+            variable_scores = {}
+            for var in variables:
+                score = sum(1 for constraint_vars, _ in constraints if var in constraint_vars)
+                variable_scores[var] = score
+            
+            # Take top constrained variables
+            sorted_vars = sorted(variable_scores.items(), key=lambda x: x[1], reverse=True)
+            variables = set([var for var, _ in sorted_vars[:20]])
+        
+        assignment = {}
+        if self.backtrack_csp(list(variables), constraints, assignment, 0):
+            return assignment
+        return None
+    
+    def backtrack_csp(self, variables, constraints, assignment, var_index):
+        """Backtracking search with pruning"""
+        if var_index == len(variables):
+            return self.satisfies_all_constraints(assignment, constraints)
+        
+        var = variables[var_index]
+        
+        for value in [False, True]:  # Try safe first, then mine
+            assignment[var] = value
+            
+            if self.is_consistent_assignment(assignment, constraints):
+                if self.backtrack_csp(variables, constraints, assignment, var_index + 1):
+                    return True
+            
+            del assignment[var]
+        
+        return False
+    
+    def is_consistent_assignment(self, assignment, constraints):
+        """Check if current assignment is consistent"""
+        for constraint_vars, target_mines in constraints:
+            assigned_mines = sum(1 for v in constraint_vars 
+                               if v in assignment and assignment[v])
+            unassigned = [v for v in constraint_vars if v not in assignment]
+            
+            if assigned_mines > target_mines:
+                return False
+            if assigned_mines + len(unassigned) < target_mines:
+                return False
+        
+        return True
+    
+    def satisfies_all_constraints(self, assignment, constraints):
+        """Check if complete assignment satisfies all constraints"""
+        for constraint_vars, target_mines in constraints:
+            actual_mines = sum(1 for v in constraint_vars 
+                             if assignment.get(v, False))
+            if actual_mines != target_mines:
+                return False
+        return True
+    
+    def advanced_probabilistic_move(self, game):
+        """Advanced probabilistic analysis with multiple probability sources"""
+        prob_map = {}
+        
+        # Basic constraint-based probabilities
+        constraints = self.build_constraints(game)
+        for constraint_vars, target_mines in constraints:
+            if len(constraint_vars) > 0:
+                base_prob = target_mines / len(constraint_vars)
+                for var in constraint_vars:
+                    if var not in prob_map:
+                        prob_map[var] = []
+                    prob_map[var].append(base_prob)
+        
+        # Global mine density consideration
+        total_tiles = game.size_x * game.size_y
+        revealed_tiles = sum(1 for x in range(game.size_x) for y in range(game.size_y) 
+                           if game.tiles[x][y]["state"] != STATE_DEFAULT)
+        flagged_mines = sum(1 for x in range(game.size_x) for y in range(game.size_y) 
+                          if game.tiles[x][y]["state"] == STATE_FLAGGED)
+        
+        remaining_tiles = total_tiles - revealed_tiles
+        remaining_mines = game.total_mines - flagged_mines
+        
+        if remaining_tiles > 0:
+            global_prob = remaining_mines / remaining_tiles
+            
+            # Apply global probability to unconstrained tiles
+            for x in range(game.size_x):
+                for y in range(game.size_y):
+                    if game.tiles[x][y]["state"] == STATE_DEFAULT:
+                        var = (x, y)
+                        if var not in prob_map:
+                            prob_map[var] = [global_prob]
+        
+        if not prob_map:
+            return None
+        
+        # Combine probabilities (weighted average favoring constraint-based)
+        final_probs = {}
+        for var, probs in prob_map.items():
+            if len(probs) > 1:
+                # Weight constraint-based probabilities more heavily
+                constraint_probs = probs[:-1] if len(probs) > 1 else probs
+                global_prob = probs[-1] if len(probs) > 1 else 0
+                
+                if constraint_probs:
+                    avg_constraint = sum(constraint_probs) / len(constraint_probs)
+                    final_probs[var] = 0.8 * avg_constraint + 0.2 * global_prob
+                else:
+                    final_probs[var] = global_prob
+            else:
+                final_probs[var] = probs[0]
+        
+        # Find best move
+        safe_tiles = [var for var, prob in final_probs.items() if prob < 0.001]
+        if safe_tiles:
+            return ("click", safe_tiles[0][0], safe_tiles[0][1])
+        
+        sure_mines = [var for var, prob in final_probs.items() if prob > 0.999]
+        if sure_mines:
+            return ("flag", sure_mines[0][0], sure_mines[0][1])
+        
+        # Choose lowest probability
+        if final_probs:
+            best_var = min(final_probs.items(), key=lambda x: x[1])[0]
+            return ("click", best_var[0], best_var[1])
+        
+        return None
+    
+    def pattern_recognition_move(self, game):
+        """Recognize common minesweeper patterns"""
+        # Pattern 1: 1-2-1 pattern
+        for x in range(game.size_x - 2):
+            for y in range(game.size_y):
+                if (game.tiles[x][y]["state"] == STATE_CLICKED and game.tiles[x][y]["mines"] == 1 and
+                    game.tiles[x+1][y]["state"] == STATE_CLICKED and game.tiles[x+1][y]["mines"] == 2 and
+                    game.tiles[x+2][y]["state"] == STATE_CLICKED and game.tiles[x+2][y]["mines"] == 1):
+                    
+                    # Check for specific 1-2-1 pattern solutions
+                    pattern_move = self.solve_121_pattern(game, x, y)
+                    if pattern_move:
+                        return pattern_move
+        
+        # Pattern 2: Corner patterns
+        corner_move = self.solve_corner_patterns(game)
+        if corner_move:
+            return corner_move
+        
+        return None
+    
+    def solve_121_pattern(self, game, x, y):
+        """Solve 1-2-1 patterns"""
+        # This is a simplified version - would need more complex analysis
+        # for real 1-2-1 pattern recognition
+        return None
+    
+    def solve_corner_patterns(self, game):
+        """Solve corner and edge patterns"""
+        # Check corners for special cases
+        corners = [(0, 0), (0, game.size_y-1), (game.size_x-1, 0), (game.size_x-1, game.size_y-1)]
+        
+        for cx, cy in corners:
+            if game.tiles[cx][cy]["state"] == STATE_CLICKED:
+                neighbors = game.get_neighbors(cx, cy)
+                unknown = [n for n in neighbors if n["state"] == STATE_DEFAULT]
+                if len(unknown) == 1 and game.tiles[cx][cy]["mines"] == 1:
+                    # Single unknown neighbor of a 1 in corner
+                    flagged_neighbors = sum(1 for n in neighbors if n["state"] == STATE_FLAGGED)
+                    if flagged_neighbors == 0:
+                        n = unknown[0]
+                        return ("flag", n["coords"]["x"], n["coords"]["y"])
+        
+        return None
+    
+    def strategic_random_move(self, game):
+        """Smart random move that avoids obviously bad choices"""
+        unknown_tiles = []
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                if game.tiles[x][y]["state"] == STATE_DEFAULT:
+                    unknown_tiles.append((x, y))
+        
+        if not unknown_tiles:
+            return None
+        
+        # Prefer tiles that are:
+        # 1. Not adjacent to many numbered tiles (lower constraint density)
+        # 2. In areas with more space (less cramped)
+        # 3. Away from high-number tiles when possible
+        
+        tile_scores = {}
+        for x, y in unknown_tiles:
+            score = 0
+            neighbors = game.get_neighbors(x, y)
+            
+            # Prefer tiles with fewer numbered neighbors (less constrained)
+            numbered_neighbors = sum(1 for n in neighbors 
+                                   if n["state"] == STATE_CLICKED and n["mines"] > 0)
+            score -= numbered_neighbors * 2
+            
+            # Avoid tiles near high numbers
+            high_number_neighbors = sum(1 for n in neighbors 
+                                      if n["state"] == STATE_CLICKED and n["mines"] >= 4)
+            score -= high_number_neighbors * 3
+            
+            # Prefer tiles with more unknown neighbors (more options later)
+            unknown_neighbors = sum(1 for n in neighbors if n["state"] == STATE_DEFAULT)
+            score += unknown_neighbors
+            
+            # Slight preference for center tiles
+            center_x, center_y = game.size_x // 2, game.size_y // 2
+            distance_from_center = abs(x - center_x) + abs(y - center_y)
+            score -= distance_from_center * 0.1
+            
+            tile_scores[(x, y)] = score
+        
+        # Choose randomly from top 25% of tiles
+        sorted_tiles = sorted(tile_scores.items(), key=lambda x: x[1], reverse=True)
+        top_quarter = max(1, len(sorted_tiles) // 4)
+        best_tiles = [tile for tile, _ in sorted_tiles[:top_quarter]]
+        
+        chosen_tile = random.choice(best_tiles)
+        return ("click", chosen_tile[0], chosen_tile[1])
+
+STRATEGIES = {
+    "Random": RandomStrategy,
+    "AutoOpen": AutoOpenStrategy,
+    "Probabilistic": ProbabilisticStrategy,
+    "CSP": CSPStrategy,
+    "Hybrid": HybridStrategy
 }
 
 # Game states
@@ -291,12 +1017,15 @@ class Minesweeper:
         self.tk = tk
         self.settings = Settings()
         self.stats = Statistics()
-        self.ai = MinesweeperAI(self)
-
+        self.strategy_name = StringVar(value="AutoOpen")
+        
         # Initialize game variables
         self.size_x = DIFFICULTIES[self.settings.difficulty]["size_x"]
         self.size_y = DIFFICULTIES[self.settings.difficulty]["size_y"]
         self.total_mines = DIFFICULTIES[self.settings.difficulty]["mines"]
+        
+        # Initialize AI with proper strategy instance
+        self.ai = MinesweeperAI(self, AutoOpenStrategy())
         
         self.create_menu()
         self.setup_ui()
@@ -318,10 +1047,36 @@ class Minesweeper:
         game_menu.add_separator()
         game_menu.add_command(label="Exit", command=self.tk.quit)
         
+        # AI menu
+        ai_menu = Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="AI", menu=ai_menu)
+        
+        for strategy_name in STRATEGIES.keys():
+            ai_menu.add_radiobutton(label=strategy_name, 
+                                  variable=self.strategy_name, 
+                                  value=strategy_name,
+                                  command=self.change_strategy)
+        
         # Bind keyboard shortcuts
         self.tk.bind("<F2>", lambda e: self.restart())
         self.tk.bind("<F3>", lambda e: self.open_settings())
         self.tk.bind("<F4>", lambda e: self.open_stats())
+    
+    def change_strategy(self):
+        """Change the AI strategy based on the selected option."""
+        strategy_class = STRATEGIES[self.strategy_name.get()]
+        self.ai.set_strategy(strategy_class())
+        # Update button text
+        if hasattr(self, 'strategy_btn'):
+            self.strategy_btn.config(text=f"Strategy: {self.strategy_name.get()}")
+    
+    def cycle_strategy(self):
+        """Cycle through available strategies"""
+        strategy_names = list(STRATEGIES.keys())
+        current_index = strategy_names.index(self.strategy_name.get())
+        next_index = (current_index + 1) % len(strategy_names)
+        self.strategy_name.set(strategy_names[next_index])
+        self.change_strategy()
     
     def setup_ui(self):
         # Main container frame
@@ -364,9 +1119,19 @@ class Minesweeper:
                          font=("Arial", 10), padx=10)
         stats_btn.pack(side=LEFT, padx=(10, 0))
 
-        auto_play_btn = Button(self.bottom_frame, text="Auto Play", command=self.auto_play,
+        # Strategy selection button
+        self.strategy_btn = Button(self.bottom_frame, text=f"Strategy: {self.strategy_name.get()}", 
+                                 command=self.cycle_strategy, font=("Arial", 10), padx=10)
+        self.strategy_btn.pack(side=LEFT, padx=(10, 0))
+
+        self.auto_play_btn = Button(self.bottom_frame, text="Auto Play", command=self.toggle_auto_play,
                                font=("Arial", 10), padx=10)
-        auto_play_btn.pack(side=LEFT, padx=(10, 0))
+        self.auto_play_btn.pack(side=LEFT, padx=(10, 0))
+        
+        # AI status
+        self.ai_running = False
+        self.ai_status_label = Label(self.bottom_frame, text="AI: Stopped", font=("Arial", 9))
+        self.ai_status_label.pack(side=LEFT, padx=(10, 0))
         
         # Difficulty label
         difficulty_text = f"Difficulty: {self.settings.difficulty}"
@@ -376,11 +1141,35 @@ class Minesweeper:
         self.difficulty_label = Label(self.bottom_frame, text=difficulty_text, font=("Arial", 9))
         self.difficulty_label.pack(side=RIGHT)
     
-    def auto_play(self):
+    def toggle_auto_play(self):
+        """Toggle auto play on/off."""
         if self.game_over_flag:
             return
+            
+        if not self.ai_running:
+            self.ai_running = True
+            self.auto_play_btn.config(text="Stop AI")
+            self.ai_status_label.config(text=f"AI: Running ({self.strategy_name.get()})")
+            self.auto_play()
+        else:
+            self.ai_running = False
+            self.auto_play_btn.config(text="Auto Play")
+            self.ai_status_label.config(text="AI: Stopped")
+    
+    def auto_play(self):
+        if self.game_over_flag or not self.ai_running:
+            self.ai_running = False
+            self.auto_play_btn.config(text="Auto Play")
+            self.ai_status_label.config(text="AI: Stopped")
+            return
+            
         if self.ai.play():
-            self.tk.after(100, self.auto_play)
+            self.tk.after(50, self.auto_play) 
+        else:
+            # No more moves available
+            self.ai_running = False
+            self.auto_play_btn.config(text="Auto Play")
+            self.ai_status_label.config(text="AI: No moves")
 
     def apply_theme(self):
         theme = THEMES[self.settings.theme]
@@ -394,6 +1183,7 @@ class Minesweeper:
             label.configure(bg=theme["bg"], fg=theme["text_color"])
         
         self.difficulty_label.configure(bg=theme["bg"], fg=theme["text_color"])
+        self.ai_status_label.configure(bg=theme["bg"], fg=theme["text_color"])
     
     def create_images(self):
         """Load images from the images folder, falling back to simple colors if files don't exist"""
@@ -477,6 +1267,14 @@ class Minesweeper:
         self.first_click = True
         self.game_over_flag = False
         
+        # Reset AI
+        self.ai.reset()
+        self.ai_running = False
+        if hasattr(self, 'auto_play_btn'):
+            self.auto_play_btn.config(text="Auto Play")
+        if hasattr(self, 'ai_status_label'):
+            self.ai_status_label.config(text="AI: Stopped")
+        
         self.create_images()
         
         # Create tiles using grid layout in the game_frame
@@ -497,6 +1295,7 @@ class Minesweeper:
                 
                 tile["button"].bind(BTN_CLICK, self.on_click_wrapper(x, y))
                 tile["button"].bind(BTN_FLAG, self.on_right_click_wrapper(x, y))
+                tile["button"].bind("<Double-Button-1>", self.on_double_click_wrapper(x, y))  # Double-click for auto-open
                 tile["button"].grid(row=x, column=y, padx=1, pady=1)
                 
                 self.tiles[x][y] = tile
@@ -559,20 +1358,37 @@ class Minesweeper:
     def game_over(self, won):
         self.game_over_flag = True
         
+        # Stop AI if running
+        if self.ai_running:
+            self.ai_running = False
+            self.auto_play_btn.config(text="Auto Play")
+            self.ai_status_label.config(text="AI: Stopped")
+        
         # Record statistics
         if self.settings.save_stats and self.start_time:
             time_taken = (datetime.now() - self.start_time).total_seconds()
             self.stats.add_game(self.settings.difficulty, won, time_taken if won else None)
             self.stats.save_stats()
         
-        # Show mines and wrong flags
-        for x in range(self.size_x):
-            for y in range(self.size_y):
-                tile = self.tiles[x][y]
-                if tile["is_mine"] and tile["state"] != STATE_FLAGGED:
-                    tile["button"].config(image=self.images["mine"])
-                elif not tile["is_mine"] and tile["state"] == STATE_FLAGGED:
-                    tile["button"].config(image=self.images["wrong"])
+        if not won:
+            # Show only mines and wrong flags, highlight the triggered mine
+            for x in range(self.size_x):
+                for y in range(self.size_y):
+                    tile = self.tiles[x][y]
+                    if tile["is_mine"] and tile["state"] != STATE_FLAGGED:
+                        if tile["state"] == STATE_CLICKED:  # This is the mine that was clicked
+                            tile["button"].config(image=self.images["mine"], bg="red")
+                        else:
+                            tile["button"].config(image=self.images["mine"])
+                    elif not tile["is_mine"] and tile["state"] == STATE_FLAGGED:
+                        tile["button"].config(image=self.images["wrong"], bg="red")
+        else:
+            # For winning, just show unflagged mines normally
+            for x in range(self.size_x):
+                for y in range(self.size_y):
+                    tile = self.tiles[x][y]
+                    if tile["is_mine"] and tile["state"] != STATE_FLAGGED:
+                        tile["button"].config(image=self.images["mine"])
         
         self.tk.update()
         
@@ -614,6 +1430,24 @@ class Minesweeper:
     def on_right_click_wrapper(self, x, y):
         return lambda event: self.on_right_click(self.tiles[x][y])
     
+    def on_double_click_wrapper(self, x, y):
+        return lambda event: self.on_double_click(self.tiles[x][y])
+    
+    def on_double_click(self, tile):
+        """Handle double-click for auto-opening neighbors (like middle-click in traditional minesweeper)"""
+        if self.game_over_flag or tile["state"] != STATE_CLICKED:
+            return
+        
+        x, y = tile["coords"]["x"], tile["coords"]["y"]
+        neighbors = self.get_neighbors(x, y)
+        flag_count = sum(1 for n in neighbors if n["state"] == STATE_FLAGGED)
+        
+        # Only auto-open if the number of flags matches the mine count
+        if flag_count == tile["mines"]:
+            for neighbor in neighbors:
+                if neighbor["state"] == STATE_DEFAULT:
+                    self.on_click(neighbor)
+    
     def on_click(self, tile):
         if self.game_over_flag or tile["state"] != STATE_DEFAULT:
             return
@@ -638,7 +1472,6 @@ class Minesweeper:
             self.clear_surrounding_tiles(tile["id"])
         else:
             tile["button"].config(image=self.images["numbers"][tile["mines"] - 1], relief="sunken")
-            self.check_auto_open_neighbors(tile)
         
         if tile["state"] != STATE_CLICKED:
             tile["state"] = STATE_CLICKED
@@ -647,16 +1480,6 @@ class Minesweeper:
         # Check win condition
         if self.clicked_count == (self.size_x * self.size_y) - self.total_mines:
             self.game_over(True)
-
-    def check_auto_open_neighbors(self, tile):
-        x, y = tile["coords"]["x"], tile["coords"]["y"]
-        neighbors = self.get_neighbors(x, y)
-        flag_count = sum(1 for n in neighbors if n["state"] == STATE_FLAGGED)
-
-        if flag_count == tile["mines"]:
-            for n in neighbors:
-                if n["state"] == STATE_DEFAULT:
-                    self.on_click(n)
 
     
     def on_right_click(self, tile):
@@ -719,26 +1542,6 @@ class Minesweeper:
     
     def open_stats(self):
         StatsWindow(self.tk, self.stats)
-
-
-class MinesweeperAI:
-    def __init__(self, game):
-        self.game = game
-        self.actions_taken = []
-
-    def play(self):
-        """AI tự động đưa ra hành động"""
-        # Ví dụ đơn giản: chọn 1 ô chưa mở và chưa flag, rồi click
-        for x in range(self.game.size_x):
-            for y in range(self.game.size_y):
-                tile = self.game.tiles[x][y]
-                if tile["state"] == STATE_DEFAULT:
-                    self.game.on_click(tile)
-                    self.actions_taken.append(("click", x, y))
-                    return  # chỉ thực hiện 1 hành động mỗi lần gọi
-
-    def reset(self):
-        self.actions_taken = []
 
 def main():
     # Create main window
