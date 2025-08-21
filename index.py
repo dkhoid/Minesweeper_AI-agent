@@ -9,6 +9,8 @@ from datetime import datetime
 import json
 import os
 from abc import ABC, abstractmethod
+from collections import defaultdict
+from typing import Optional, Tuple, List, Dict, Set
 
 # Difficulty settings
 DIFFICULTIES = {
@@ -736,12 +738,276 @@ class HybridStrategy(AIStrategy):
         chosen_tile = random.choice(best_tiles)
         return ("click", chosen_tile[0], chosen_tile[1])
 
+class BasicPatternStrategy(AIStrategy):
+
+    """
+    Class xử lý các pattern cơ bản trong Minesweeper: 1-1, 1-2, 1-2-1, 1-2-2-1.
+    Kế thừa AIStrategy để tích hợp vào MinesweeperAI.
+    """
+    
+    def next_move(self, game) -> Optional[Tuple[str, int, int]]:
+        """
+        Tìm nước đi dựa trên pattern. Ưu tiên flag mìn trước, sau đó click safe.
+        Quét horizontal và vertical.
+        """
+        # First try basic deterministic moves (like AutoOpenStrategy)
+        basic_move = self._find_basic_moves(game)
+        if basic_move:
+            return basic_move
+        
+        # Ưu tiên 1-2-1 vì phổ biến
+        move = self._find_121_pattern(game)
+        if move:
+            return move
+        
+        # Tiếp theo 1-2-2-1
+        move = self._find_1221_pattern(game)
+        if move:
+            return move
+        
+        # 1-2
+        move = self._find_12_pattern(game)
+        if move:
+            return move
+        
+        # 1-1
+        move = self._find_11_pattern(game)
+        if move:
+            return move
+        
+        # Fallback to random move
+        unclicked_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
+                           if game.tiles[x][y]["state"] == STATE_DEFAULT]
+        if unclicked_tiles:
+            x, y = random.choice(unclicked_tiles)
+            return ('click', x, y)
+        
+        return None
+    
+    def _find_basic_moves(self, game):
+        """Find basic deterministic moves first"""
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                t = game.tiles[x][y]
+                if t["state"] == STATE_CLICKED and t["mines"] > 0:
+                    neigh = game.get_neighbors(x, y)
+                    flag_cnt = sum(1 for n in neigh if n["state"] == STATE_FLAGGED)
+                    unflagged = [n for n in neigh if n["state"] == STATE_DEFAULT]
+                    
+                    # Auto-open: all mines already flagged
+                    if flag_cnt == t["mines"] and unflagged:
+                        n = unflagged[0]
+                        return ("click", n["coords"]["x"], n["coords"]["y"])
+                    
+                    # Auto-flag: remaining tiles must all be mines
+                    remaining_mines = t["mines"] - flag_cnt
+                    if remaining_mines > 0 and len(unflagged) == remaining_mines:
+                        n = unflagged[0]
+                        return ("flag", n["coords"]["x"], n["coords"]["y"])
+        return None
+    
+    def _check_tiles_in_line(self, game, tiles_coords):
+        """Helper: Check if all tiles in given coordinates exist and are unknown"""
+        for x, y in tiles_coords:
+            if x < 0 or x >= game.size_x or y < 0 or y >= game.size_y:
+                return False
+            if game.tiles[x][y]["state"] != STATE_DEFAULT:
+                return False
+        return True
+    
+    def _find_121_pattern(self, game):
+        """
+        Tìm 1-2-1 horizontal và vertical pattern.
+        Pattern: khi có 1-2-1 và một hàng unknown bên trên/dưới,
+        thì ô đối diện với các số 1 là mìn, ô đối diện với số 2 là safe.
+        """
+        # Horizontal 1-2-1 pattern
+        for x in range(game.size_x):
+            for y in range(game.size_y - 2):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x][y+1]
+                t3 = game.tiles[x][y+2]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
+                    t3["state"] == STATE_CLICKED and t3["mines"] == 1):
+                    
+                    # Check row above
+                    if x > 0:
+                        above_coords = [(x-1, y), (x-1, y+1), (x-1, y+2)]
+                        if self._check_tiles_in_line(game, above_coords):
+                            # Flag mines (opposite to 1s), click safe (opposite to 2)
+                            return ('flag', x-1, y)  # Flag first mine
+                    
+                    # Check row below
+                    if x < game.size_x - 1:
+                        below_coords = [(x+1, y), (x+1, y+1), (x+1, y+2)]
+                        if self._check_tiles_in_line(game, below_coords):
+                            return ('flag', x+1, y)  # Flag first mine
+        
+        # Vertical 1-2-1 pattern
+        for y in range(game.size_y):
+            for x in range(game.size_x - 2):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x+1][y]
+                t3 = game.tiles[x+2][y]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
+                    t3["state"] == STATE_CLICKED and t3["mines"] == 1):
+                    
+                    # Check column left
+                    if y > 0:
+                        left_coords = [(x, y-1), (x+1, y-1), (x+2, y-1)]
+                        if self._check_tiles_in_line(game, left_coords):
+                            return ('flag', x, y-1)  # Flag first mine
+                    
+                    # Check column right
+                    if y < game.size_y - 1:
+                        right_coords = [(x, y+1), (x+1, y+1), (x+2, y+1)]
+                        if self._check_tiles_in_line(game, right_coords):
+                            return ('flag', x, y+1)  # Flag first mine
+        
+        return None
+    
+    def _find_1221_pattern(self, game):
+        """
+        Tìm 1-2-2-1 pattern.
+        Similar to 1-2-1 but with 4 tiles: 1-2-2-1
+        Mines are opposite to 1s, safe tiles are opposite to 2s
+        """
+        # Horizontal 1-2-2-1 pattern
+        for x in range(game.size_x):
+            for y in range(game.size_y - 3):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x][y+1]
+                t3 = game.tiles[x][y+2]
+                t4 = game.tiles[x][y+3]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
+                    t3["state"] == STATE_CLICKED and t3["mines"] == 2 and
+                    t4["state"] == STATE_CLICKED and t4["mines"] == 1):
+                    
+                    # Check row above
+                    if x > 0:
+                        above_coords = [(x-1, y), (x-1, y+1), (x-1, y+2), (x-1, y+3)]
+                        if self._check_tiles_in_line(game, above_coords):
+                            return ('flag', x-1, y)  # Flag first mine
+                    
+                    # Check row below
+                    if x < game.size_x - 1:
+                        below_coords = [(x+1, y), (x+1, y+1), (x+1, y+2), (x+1, y+3)]
+                        if self._check_tiles_in_line(game, below_coords):
+                            return ('flag', x+1, y)  # Flag first mine
+        
+        # Vertical 1-2-2-1 pattern
+        for y in range(game.size_y):
+            for x in range(game.size_x - 3):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x+1][y]
+                t3 = game.tiles[x+2][y]
+                t4 = game.tiles[x+3][y]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
+                    t3["state"] == STATE_CLICKED and t3["mines"] == 2 and
+                    t4["state"] == STATE_CLICKED and t4["mines"] == 1):
+                    
+                    # Check column left
+                    if y > 0:
+                        left_coords = [(x, y-1), (x+1, y-1), (x+2, y-1), (x+3, y-1)]
+                        if self._check_tiles_in_line(game, left_coords):
+                            return ('flag', x, y-1)  # Flag first mine
+                    
+                    # Check column right
+                    if y < game.size_y - 1:
+                        right_coords = [(x, y+1), (x+1, y+1), (x+2, y+1), (x+3, y+1)]
+                        if self._check_tiles_in_line(game, right_coords):
+                            return ('flag', x, y+1)  # Flag first mine
+        
+        return None
+    
+    def _find_12_pattern(self, game):
+        """
+        Tìm 1-2 pattern followed by unknown tile.
+        In a 1-2-X pattern along edges, X is often a mine.
+        """
+        # Horizontal 1-2 pattern
+        for x in range(game.size_x):
+            for y in range(game.size_y - 2):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x][y+1]
+                t_unknown = game.tiles[x][y+2]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
+                    t_unknown["state"] == STATE_DEFAULT):
+                    
+                    # Check if this is near an edge or has specific neighbor patterns
+                    # For simplicity, flag the unknown tile in 1-2-X pattern
+                    if x == 0 or x == game.size_x - 1:  # Near top/bottom edge
+                        return ('flag', x, y+2)
+        
+        # Vertical 1-2 pattern
+        for y in range(game.size_y):
+            for x in range(game.size_x - 2):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x+1][y]
+                t_unknown = game.tiles[x+2][y]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
+                    t_unknown["state"] == STATE_DEFAULT):
+                    
+                    if y == 0 or y == game.size_y - 1:  # Near left/right edge
+                        return ('flag', x+2, y)
+        
+        return None
+    
+    def _find_11_pattern(self, game):
+        """
+        Tìm 1-1 pattern near borders.
+        In a 1-1-X pattern near edges, X is often safe.
+        """
+        # Horizontal 1-1 pattern near edges
+        for x in range(game.size_x):
+            for y in range(game.size_y - 2):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x][y+1]
+                t_unknown = game.tiles[x][y+2]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 1 and
+                    t_unknown["state"] == STATE_DEFAULT):
+                    
+                    # Near edge, the third tile is often safe
+                    if x == 0 or x == game.size_x - 1:  # Near top/bottom edge
+                        return ('click', x, y+2)
+        
+        # Vertical 1-1 pattern near edges
+        for y in range(game.size_y):
+            for x in range(game.size_x - 2):
+                t1 = game.tiles[x][y]
+                t2 = game.tiles[x+1][y]
+                t_unknown = game.tiles[x+2][y]
+                
+                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
+                    t2["state"] == STATE_CLICKED and t2["mines"] == 1 and
+                    t_unknown["state"] == STATE_DEFAULT):
+                    
+                    if y == 0 or y == game.size_y - 1:  # Near left/right edge
+                        return ('click', x+2, y)
+        
+        return None
+
 STRATEGIES = {
     "Random": RandomStrategy,
     "AutoOpen": AutoOpenStrategy,
     "Probabilistic": ProbabilisticStrategy,
     "CSP": CSPStrategy,
-    "Hybrid": HybridStrategy
+    "Hybrid": HybridStrategy,
+    "basicPattern": BasicPatternStrategy
 }
 
 # Game states
