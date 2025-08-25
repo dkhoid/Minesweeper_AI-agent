@@ -12,3 +12,10 @@ The application also includes:
 * **UI** with Tkinter (menu for difficulty selection, theme selection, viewing statistics).
 * **Settings & Statistics** (saving configurations, recording results to JSON files).
 * **Auto Play** (AI automatically plays using the selected strategy).
+
+## Run the Application
+To run the application, ensure you have Python installed and then execute the following command in your terminal:
+
+```
+python index.py
+```

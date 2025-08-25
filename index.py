@@ -3522,7 +3522,6 @@ STRATEGIES = {
     "Pattern": AdvancedPatternStrategy,
     "CSP": EnhancedCSPStrategy,
     "Hybrid": HybridStrategy,
-
 }
 
 # Game states
@@ -3848,6 +3847,8 @@ class Minesweeper:
         game_menu.add_separator()
         game_menu.add_command(label="Settings", command=self.open_settings, accelerator="F3")
         game_menu.add_command(label="Statistics", command=self.open_stats, accelerator="F4")
+        game_menu.add_command(label="Change Strategy", command=self.change_strategy, accelerator="F5")
+        game_menu.add_command(label="Auto Play", command=self.auto_play, accelerator="F6")
 
         game_menu.add_separator()
         game_menu.add_command(label="Exit", command=self.tk.quit)
@@ -3866,6 +3867,9 @@ class Minesweeper:
         self.tk.bind("<F2>", lambda e: self.restart())
         self.tk.bind("<F3>", lambda e: self.open_settings())
         self.tk.bind("<F4>", lambda e: self.open_stats())
+        self.tk.bind("<F6>", lambda e: self.change_strategy())
+        self.tk.bind("<F5>", lambda e: self.auto_play())
+
 
     def change_strategy(self):
         """Change the AI strategy based on the selected option."""
@@ -3926,16 +3930,16 @@ class Minesweeper:
 
         # Strategy selection button
         self.strategy_btn = Button(self.bottom_frame, text=f"Strategy: {self.strategy_name.get()}",
-                                   command=self.cycle_strategy, font=("Arial", 10), padx=10)
+                                   command=self.cycle_strategy, font=("Arial", 10), padx=10, width=25)
         self.strategy_btn.pack(side="left", padx=(10, 0))
 
         self.auto_play_btn = Button(self.bottom_frame, text="Auto Play", command=self.toggle_auto_play,
-                                    font=("Arial", 10), padx=10)
+                            font=("Arial", 10), padx=10, width=20)  # Add fixed width
         self.auto_play_btn.pack(side="left", padx=(10, 0))
 
         # AI status
         self.ai_running = False
-        self.ai_status_label = Label(self.bottom_frame, text="AI: Stopped", font=("Arial", 9))
+        self.ai_status_label = Label(self.bottom_frame, text="AI: Stopped", font=("Arial", 10), width=15)  # Add fixed width
         self.ai_status_label.pack(side="left", padx=(10, 0))
 
         # Difficulty label
@@ -3954,7 +3958,7 @@ class Minesweeper:
         if not self.ai_running:
             self.ai_running = True
             self.auto_play_btn.config(text="Stop AI")
-            self.ai_status_label.config(text=f"AI: Running ({self.strategy_name.get()})")
+            self.ai_status_label.config(text="AI: Running")
             self.auto_play()
         else:
             self.ai_running = False
@@ -3991,8 +3995,8 @@ class Minesweeper:
         self.ai_status_label.configure(bg=theme["bg"], fg=theme["text_color"])
 
     def create_images(self):
-        """Load images from the images folder, falling back to simple colors if files don't exist"""
-        self.images = {}  # Change from defaultdict to regular dict
+        """Load images from the images folder, scaling them to match button size"""
+        self.images = {}
 
         # Try to load actual image files first
         image_path = "images"
@@ -4009,48 +4013,82 @@ class Minesweeper:
             try:
                 filepath = os.path.join(image_path, filename)
                 if os.path.exists(filepath):
-                    self.images[key] = PhotoImage(file=filepath)
+                    original_img = PhotoImage(file=filepath)
+                    # Scale the image to better fit 30x30 buttons
+                    # If original is smaller, zoom it; if larger, subsample it
+                    orig_width = original_img.width()
+                    orig_height = original_img.height()
+
+                    if orig_width < 30 or orig_height < 30:
+                        # Zoom up if too small
+                        zoom_factor = max(30 // orig_width, 30 // orig_height, 1)
+                        self.images[key] = original_img.zoom(zoom_factor, zoom_factor)
+                    elif orig_width > 30 or orig_height > 30:
+                        # Subsample down if too large
+                        subsample_factor = max(orig_width // 30, orig_height // 30, 1)
+                        self.images[key] = original_img.subsample(subsample_factor, subsample_factor)
+                    else:
+                        # Perfect size
+                        self.images[key] = original_img
                 else:
                     # Fallback to colored rectangles
                     self.images[key] = self.create_fallback_image(key)
-            except:
+            except Exception as e:
+                print(f"Error loading {filename}: {e}")
                 self.images[key] = self.create_fallback_image(key)
 
         # Load number tiles (1-8)
-        self.images["numbers"] = []  # Initialize as empty list
+        self.images["numbers"] = []
         for i in range(1, 9):
             try:
                 filepath = os.path.join(image_path, f"tile_{i}.gif")
                 if os.path.exists(filepath):
-                    img = PhotoImage(file=filepath)
+                    original_img = PhotoImage(file=filepath)
+                    # Scale the image to better fit 30x30 buttons
+                    orig_width = original_img.width()
+                    orig_height = original_img.height()
+                    scaled_img = None
+                    if orig_width < 30 or orig_height < 30:
+                        # Zoom up if too small
+                        zoom_factor = max(30 // orig_width, 30 // orig_height, 1)
+                        scaled_img = original_img.zoom(zoom_factor, zoom_factor)
+                    elif orig_width > 30 or orig_height > 30:
+                        # Subsample down if too large
+                        subsample_factor = max(orig_width // 30, orig_height // 30, 1)
+                        scaled_img = original_img.subsample(subsample_factor, subsample_factor)
+                    else:
+                        # Perfect size
+                        scaled_img = original_img
+
+                    self.images["numbers"].append(scaled_img)
                 else:
-                    img = self.create_fallback_number_image(i)
-                self.images["numbers"].append(img)
-            except:
+                    self.images["numbers"].append(self.create_fallback_number_image(i))
+            except Exception as e:
+                print(f"Error loading tile_{i}.gif: {e}")
                 self.images["numbers"].append(self.create_fallback_number_image(i))
 
     def create_fallback_image(self, image_type):
         """Create fallback colored rectangle images"""
         theme = THEMES[self.settings.theme]
-        img = PhotoImage(width=20, height=20)
+        img = PhotoImage(width=30, height=30)  # Changed from 20x20 to 30x30
 
         if image_type == "plain":
-            img.put(theme["button_bg"], to=(0, 0, 20, 20))
+            img.put(theme["button_bg"], to=(0, 0, 30, 30))
         elif image_type == "clicked":
-            img.put("#ffffff", to=(0, 0, 20, 20))
+            img.put("#ffffff", to=(0, 0, 30, 30))
         elif image_type == "mine":
-            img.put(theme["mine_color"], (0, 0, 20, 20))
+            img.put(theme["mine_color"], (0, 0, 30, 30))
         elif image_type == "flag":
-            img.put(theme["flag_color"], (0, 0, 20, 20))
+            img.put(theme["flag_color"], (0, 0, 30, 30))
         elif image_type == "wrong":
-            img.put("#888888", (0, 0, 20, 20))
+            img.put("#888888", (0, 0, 30, 30))
 
         return img
 
     def create_fallback_number_image(self, number):
         """Create fallback number images"""
         img = PhotoImage(width=20, height=20)
-        img.put("#ffffff", (0, 0, 20, 20))
+        # img.put("#ffffff", (0, 0, 20, 20))
         return img
 
     def setup(self):
@@ -4089,7 +4127,7 @@ class Minesweeper:
                     "coords": {"x": x, "y": y},
                     "mines": 0,
                     "button": Button(self.game_frame, image=self.images["plain"],
-                                     width=25, height=25, bd=1, relief="raised")
+                                     width=30, height=30, bd=1, relief="raised")
                 }
 
                 tile["button"].bind(BTN_CLICK, self.on_click_wrapper(x, y))
@@ -4155,19 +4193,122 @@ class Minesweeper:
         self.labels["flags"].config(text=f"Flags: {self.flag_count}")
         self.labels["mines"].config(text=f"Mines: {self.total_mines}")
 
+    def show_game_over_dialog(self, won):
+        """Show a custom game over dialog with larger text"""
+        # Create custom dialog window
+        dialog = Toplevel(self.tk)
+        dialog.title("You Win!" if won else "Mine Exploded!")
+        dialog.resizable(False, False)
+        dialog.grab_set()  # Make it modal
+
+        # Configure dialog styling
+        dialog.configure(bg="#f0f0f0")
+
+        # Prepare message text
+        if won:
+            msg = (
+                f"🎉 You cleared the minefield!\n\n"
+                f"Time: {self.time_taken}\n"
+                f"Flags used: {self.flag_count}\n"
+                f"Difficulty: {self.settings.difficulty}\n\n"
+                "Would you like to play again?"
+            )
+        else:
+            msg = (
+                "💥 Boom! You hit a mine.\n\n"
+                f"Flags placed: {self.flag_count}\n"
+                f"Difficulty: {self.settings.difficulty}\n\n"
+                "Try again?"
+            )
+
+        # Create and pack the message label with large font
+        message_label = Label(
+            dialog,
+            text=msg,
+            font=("Arial", 14, "normal"),  # Much larger font
+            bg="#f0f0f0",
+            fg="#333333",
+            justify="center",
+            padx=30,
+            pady=20
+        )
+        message_label.pack(pady=(20, 10))
+
+        # Frame for buttons
+        button_frame = Frame(dialog, bg="#f0f0f0")
+        button_frame.pack(pady=(10, 20))
+
+        # Result variable to store user choice
+        result = [False]  # Use list so it's mutable in nested function
+
+        def on_yes():
+            result[0] = True
+            dialog.destroy()
+
+        def on_no():
+            result[0] = False
+            dialog.destroy()
+
+        # Create buttons with larger font
+        yes_btn = Button(
+            button_frame,
+            text="Yes",
+            command=on_yes,
+            font=("Arial", 12, "bold"),
+            padx=20,
+            pady=8,
+            bg="#4CAF50",
+            fg="white",
+            activebackground="#45a049",
+            width=8
+        )
+        yes_btn.pack(side="left", padx=(0, 10))
+
+        no_btn = Button(
+            button_frame,
+            text="No",
+            command=on_no,
+            font=("Arial", 12, "bold"),
+            padx=20,
+            pady=8,
+            bg="#f44336",
+            fg="white",
+            activebackground="#da190b",
+            width=8
+        )
+        no_btn.pack(side="left")
+
+        # Center the dialog
+        dialog.update_idletasks()
+        width = dialog.winfo_reqwidth()
+        height = dialog.winfo_reqheight()
+        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (dialog.winfo_screenheight() // 2) - (height // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        # Set focus and bind Enter/Escape keys
+        yes_btn.focus_set()
+        dialog.bind("<Return>", lambda e: on_yes())
+        dialog.bind("<Escape>", lambda e: on_no())
+
+        # Wait for dialog to close
+        dialog.wait_window()
+
+        return result[0]
+
     def game_over(self, won, clicked_mine_x=None, clicked_mine_y=None):
         self.game_over_flag = True
 
         # Stop AI if running
         if self.ai_running:
             self.ai_running = False
-            self.auto_play_btn.config(text="Auto Play")
+            self.auto_play_btn.config(  text="Auto Play  ")
             self.ai_status_label.config(text="AI: Stopped")
 
         # Record statistics
         if self.settings.save_stats and self.start_time:
-            time_taken = (datetime.now() - self.start_time).total_seconds()
-            self.stats.add_game(self.settings.difficulty, won, time_taken if won else None)
+            self.time_taken = (datetime.now() - self.start_time).total_seconds()
+            self.stats.add_game(self.settings.difficulty, won, self.time_taken if won else None)
             self.stats.save_stats()
 
         if not won:
@@ -4197,10 +4338,8 @@ class Minesweeper:
 
         self.tk.update()
 
-        # Show result dialog
-        msg = "Congratulations! You won!\n\nPlay again?" if won else "Game Over! You hit a mine!\n\nPlay again?"
-        if tkMessageBox.askyesno("Game Over", msg):
-            self.restart()
+        if self.show_game_over_dialog(won):
+            self.tk.after(100, self.restart)
 
     def update_timer(self):
         if self.settings.show_timer:
@@ -4216,7 +4355,7 @@ class Minesweeper:
         else:
             self.labels["time"].config(text="")
 
-        self.tk.after(100, self.update_timer)
+        self.tk.after(25, self.update_timer)
 
     def get_neighbors(self, x, y):
         neighbors = []
@@ -4352,7 +4491,7 @@ class Minesweeper:
 def main():
     # Create main window
     window = Tk()
-    window.title("Enhanced Minesweeper")
+    window.title("Minesweeper")
     window.resizable(False, False)
 
     # Center window on screen
