@@ -19,3 +19,7 @@ To run the application, ensure you have Python installed and then execute the fo
 ```
 python index.py
 ```
+or run benchmark
+```
+python index.py --benchmark
+```
