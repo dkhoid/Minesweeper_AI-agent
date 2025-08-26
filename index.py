@@ -1,14 +1,16 @@
-from tkinter import *
-from tkinter import messagebox as tkMessageBox
-from tkinter import ttk
-from collections import deque
-import random
-import platform
-from datetime import datetime
 import json
 import os
+import platform
+import random
+import time
+import copy
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from collections import deque
+from datetime import datetime
+from tkinter import *
+from tkinter import ttk
 from typing import Optional, Tuple
 
 # Difficulty settings
@@ -106,60 +108,6 @@ class AutoOpenStrategy(AIStrategy):
             return ('click', x, y)
 
         return None
-
-
-class ProbabilisticStrategy(AIStrategy):
-    def next_move(self, game):
-        prob_map = {}  # (x,y) -> estimated mine probability
-
-        # 1. Duyệt qua tất cả ô số đã mở
-        for x in range(game.size_x):
-            for y in range(game.size_y):
-                t = game.tiles[x][y]
-                if t["state"] == STATE_CLICKED and t["mines"] > 0:
-                    neigh = game.get_neighbors(x, y)
-                    unflagged_default = [n for n in neigh if n["state"] == STATE_DEFAULT]
-                    flagged_count = sum(1 for n in neigh if n["state"] == STATE_FLAGGED)
-
-                    remaining_mines = t["mines"] - flagged_count
-                    if len(unflagged_default) > 0 and remaining_mines >= 0:
-                        p = remaining_mines / len(unflagged_default)
-
-                        # cập nhật xác suất cho từng ô
-                        for n in unflagged_default:
-                            coord = (n["coords"]["x"], n["coords"]["y"])
-                            if coord not in prob_map:
-                                prob_map[coord] = []
-                            prob_map[coord].append(p)
-
-        # 2. Gom xác suất lại (lấy max hoặc trung bình)
-        final_probs = {}
-        for coord, probs in prob_map.items():
-            # final_probs[coord] = max(probs)   # conservative
-            final_probs[coord] = sum(probs) / len(probs)  # average
-
-        if not final_probs:
-            # Nếu không có constraint nào, random
-            unclicked = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
-                         if game.tiles[x][y]["state"] == STATE_DEFAULT]
-            if unclicked:
-                return ("click", *random.choice(unclicked))
-            return None
-
-        # 3. Tìm nước đi tốt nhất
-        safe_moves = [c for c, p in final_probs.items() if p == 0]
-        if safe_moves:
-            x, y = safe_moves[0]
-            return ("click", x, y)
-
-        sure_flags = [c for c, p in final_probs.items() if p == 1]
-        if sure_flags:
-            x, y = sure_flags[0]
-            return ("flag", x, y)
-
-        # 4. Nếu không có chắc chắn: chọn ô ít nguy hiểm nhất
-        best_coord = min(final_probs.items(), key=lambda kv: kv[1])[0]
-        return ("click", best_coord[0], best_coord[1])
 
 
 class EnhancedProbabilisticStrategy(AIStrategy):
@@ -894,183 +842,6 @@ class EnhancedProbabilisticStrategy(AIStrategy):
 
         # Fallback to simple random
         return ("click", *random.choice(unknown_tiles))
-
-
-class CSPStrategy(AIStrategy):
-    def next_move(self, game):
-        # Collect all constraints from numbered tiles
-        constraints = []
-        variables = set()  # All unknown tiles
-
-        # Find all unknown tiles
-        for x in range(game.size_x):
-            for y in range(game.size_y):
-                if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                    variables.add((x, y))
-
-        if not variables:
-            return None
-
-        # Build constraints from numbered tiles
-        for x in range(game.size_x):
-            for y in range(game.size_y):
-                tile = game.tiles[x][y]
-                if tile["state"] == STATE_CLICKED and tile["mines"] > 0:
-                    neighbors = game.get_neighbors(x, y)
-                    unknown_neighbors = []
-                    flagged_count = 0
-
-                    for n in neighbors:
-                        if n["state"] == STATE_DEFAULT:
-                            unknown_neighbors.append((n["coords"]["x"], n["coords"]["y"]))
-                        elif n["state"] == STATE_FLAGGED:
-                            flagged_count += 1
-
-                    if unknown_neighbors:
-                        remaining_mines = tile["mines"] - flagged_count
-                        constraints.append((unknown_neighbors, remaining_mines))
-
-        if not constraints:
-            # No constraints, random move
-            return ("click", *random.choice(list(variables)))
-
-        # Solve CSP using constraint propagation and backtracking
-        solution = self.solve_csp(variables, constraints)
-
-        if solution:
-            # Find definite mines and safe tiles
-            mines = [var for var, is_mine in solution.items() if is_mine]
-            safe_tiles = [var for var, is_mine in solution.items() if not is_mine]
-
-            # Flag a mine if found
-            if mines:
-                x, y = mines[0]
-                return ("flag", x, y)
-
-            # Click a safe tile if found
-            if safe_tiles:
-                x, y = safe_tiles[0]
-                return ("click", x, y)
-
-        # If CSP can't determine anything definitive, use probability
-        return self.fallback_probabilistic(game, constraints, variables)
-
-    def solve_csp(self, variables, constraints):
-        """Solve CSP using constraint propagation and backtracking"""
-        assignment = {}
-
-        # Try constraint propagation first
-        if self.constraint_propagation(variables, constraints, assignment):
-            return assignment
-
-        # If propagation isn't enough, try backtracking on a subset
-        # (limit to prevent too much computation)
-        if len(variables) <= 20:  # Only for small problems
-            return self.backtrack_search(variables, constraints, assignment)
-
-        return None
-
-    def constraint_propagation(self, variables, constraints, assignment):
-        """Apply constraint propagation to find forced assignments"""
-        changed = True
-        while changed:
-            changed = False
-
-            for constraint_vars, target_mines in constraints:
-                # Filter to unassigned variables in this constraint
-                unassigned = [v for v in constraint_vars if v not in assignment]
-                assigned_mines = sum(1 for v in constraint_vars
-                                     if v in assignment and assignment[v])
-
-                remaining_mines = target_mines - assigned_mines
-
-                # If remaining mines == 0, all unassigned must be safe
-                if remaining_mines == 0:
-                    for var in unassigned:
-                        if var not in assignment:
-                            assignment[var] = False
-                            changed = True
-
-                # If remaining mines == unassigned count, all must be mines
-                elif remaining_mines == len(unassigned):
-                    for var in unassigned:
-                        if var not in assignment:
-                            assignment[var] = True
-                            changed = True
-
-        return len(assignment) > 0
-
-    def backtrack_search(self, variables, constraints, assignment):
-        """Backtracking search for CSP solution"""
-        if len(assignment) == len(variables):
-            return assignment if self.is_consistent(constraints, assignment) else None
-
-        # Choose next variable (simple heuristic: first unassigned)
-        var = next(v for v in variables if v not in assignment)
-
-        # Try both values: mine and safe
-        for value in [True, False]:
-            assignment[var] = value
-            if self.is_consistent_partial(constraints, assignment):
-                result = self.backtrack_search(variables, constraints, assignment)
-                if result is not None:
-                    return result
-            del assignment[var]
-
-        return None
-
-    def is_consistent_partial(self, constraints, assignment):
-        """Check if partial assignment is consistent with constraints"""
-        for constraint_vars, target_mines in constraints:
-            assigned_mines = sum(1 for v in constraint_vars
-                                 if v in assignment and assignment[v])
-            unassigned_count = sum(1 for v in constraint_vars if v not in assignment)
-
-            # Too many mines already assigned
-            if assigned_mines > target_mines:
-                return False
-
-            # Not enough unassigned variables to reach target
-            if assigned_mines + unassigned_count < target_mines:
-                return False
-
-        return True
-
-    def is_consistent(self, constraints, assignment):
-        """Check if complete assignment satisfies all constraints"""
-        for constraint_vars, target_mines in constraints:
-            actual_mines = sum(1 for v in constraint_vars
-                               if assignment.get(v, False))
-            if actual_mines != target_mines:
-                return False
-        return True
-
-    def fallback_probabilistic(self, game, constraints, variables):
-        """Fallback to probabilistic reasoning when CSP is inconclusive"""
-        prob_map = {}
-
-        for constraint_vars, target_mines in constraints:
-            unassigned = [v for v in constraint_vars
-                          if game.tiles[v[0]][v[1]]["state"] == STATE_DEFAULT]
-
-            if len(unassigned) > 0:
-                prob = target_mines / len(unassigned)
-                for var in unassigned:
-                    if var not in prob_map:
-                        prob_map[var] = []
-                    prob_map[var].append(prob)
-
-        if prob_map:
-            # Average probabilities
-            final_probs = {var: sum(probs) / len(probs)
-                           for var, probs in prob_map.items()}
-
-            # Choose the lowest probability tile
-            best_var = min(final_probs.items(), key=lambda x: x[1])[0]
-            return ("click", best_var[0], best_var[1])
-
-        # Complete fallback to random
-        return ("click", *random.choice(list(variables)))
 
 
 class EnhancedCSPStrategy(AIStrategy):
@@ -2086,269 +1857,6 @@ class HybridStrategy(AIStrategy):
         return ("click", chosen_tile[0], chosen_tile[1])
 
 
-class BasicPatternStrategy(AIStrategy):
-    """
-    Class xử lý các pattern cơ bản trong Minesweeper: 1-1, 1-2, 1-2-1, 1-2-2-1.
-    Kế thừa AIStrategy để tích hợp vào MinesweeperAI.
-    """
-
-    def next_move(self, game) -> Optional[Tuple[str, int, int]]:
-        """
-        Tìm nước đi dựa trên pattern. Ưu tiên flag mìn trước, sau đó click safe.
-        Quét horizontal và vertical.
-        """
-        # First try basic deterministic moves (like AutoOpenStrategy)
-        basic_move = self._find_basic_moves(game)
-        if basic_move:
-            return basic_move
-
-        # Ưu tiên 1-2-1 vì phổ biến
-        move = self._find_121_pattern(game)
-        if move:
-            return move
-
-        # Tiếp theo 1-2-2-1
-        move = self._find_1221_pattern(game)
-        if move:
-            return move
-
-        # 1-2
-        move = self._find_12_pattern(game)
-        if move:
-            return move
-
-        # 1-1
-        move = self._find_11_pattern(game)
-        if move:
-            return move
-
-        # Fallback to random move
-        unclicked_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
-                           if game.tiles[x][y]["state"] == STATE_DEFAULT]
-        if unclicked_tiles:
-            x, y = random.choice(unclicked_tiles)
-            return ('click', x, y)
-
-        return None
-
-    def _find_basic_moves(self, game):
-        """Find basic deterministic moves first"""
-        for x in range(game.size_x):
-            for y in range(game.size_y):
-                t = game.tiles[x][y]
-                if t["state"] == STATE_CLICKED and t["mines"] > 0:
-                    neigh = game.get_neighbors(x, y)
-                    flag_cnt = sum(1 for n in neigh if n["state"] == STATE_FLAGGED)
-                    unflagged = [n for n in neigh if n["state"] == STATE_DEFAULT]
-
-                    # Auto-open: all mines already flagged
-                    if flag_cnt == t["mines"] and unflagged:
-                        n = unflagged[0]
-                        return ("click", n["coords"]["x"], n["coords"]["y"])
-
-                    # Auto-flag: remaining tiles must all be mines
-                    remaining_mines = t["mines"] - flag_cnt
-                    if remaining_mines > 0 and len(unflagged) == remaining_mines:
-                        n = unflagged[0]
-                        return ("flag", n["coords"]["x"], n["coords"]["y"])
-        return None
-
-    def _check_tiles_in_line(self, game, tiles_coords):
-        """Helper: Check if all tiles in given coordinates exist and are unknown"""
-        for x, y in tiles_coords:
-            if x < 0 or x >= game.size_x or y < 0 or y >= game.size_y:
-                return False
-            if game.tiles[x][y]["state"] != STATE_DEFAULT:
-                return False
-        return True
-
-    def _find_121_pattern(self, game):
-        """
-        Tìm 1-2-1 horizontal và vertical pattern.
-        Pattern: khi có 1-2-1 và một hàng unknown bên trên/dưới,
-        thì ô đối diện với các số 1 là mìn, ô đối diện với số 2 là safe.
-        """
-        # Horizontal 1-2-1 pattern
-        for x in range(game.size_x):
-            for y in range(game.size_y - 2):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x][y + 1]
-                t3 = game.tiles[x][y + 2]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
-                        t3["state"] == STATE_CLICKED and t3["mines"] == 1):
-
-                    # Check row above
-                    if x > 0:
-                        above_coords = [(x - 1, y), (x - 1, y + 1), (x - 1, y + 2)]
-                        if self._check_tiles_in_line(game, above_coords):
-                            # Flag mines (opposite to 1s), click safe (opposite to 2)
-                            return ('flag', x - 1, y)  # Flag first mine
-
-                    # Check row below
-                    if x < game.size_x - 1:
-                        below_coords = [(x + 1, y), (x + 1, y + 1), (x + 1, y + 2)]
-                        if self._check_tiles_in_line(game, below_coords):
-                            return ('flag', x + 1, y)  # Flag first mine
-
-        # Vertical 1-2-1 pattern
-        for y in range(game.size_y):
-            for x in range(game.size_x - 2):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x + 1][y]
-                t3 = game.tiles[x + 2][y]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
-                        t3["state"] == STATE_CLICKED and t3["mines"] == 1):
-
-                    # Check column left
-                    if y > 0:
-                        left_coords = [(x, y - 1), (x + 1, y - 1), (x + 2, y - 1)]
-                        if self._check_tiles_in_line(game, left_coords):
-                            return ('flag', x, y - 1)  # Flag first mine
-
-                    # Check column right
-                    if y < game.size_y - 1:
-                        right_coords = [(x, y + 1), (x + 1, y + 1), (x + 2, y + 1)]
-                        if self._check_tiles_in_line(game, right_coords):
-                            return ('flag', x, y + 1)  # Flag first mine
-
-        return None
-
-    def _find_1221_pattern(self, game):
-        """
-        Tìm 1-2-2-1 pattern.
-        Similar to 1-2-1 but with 4 tiles: 1-2-2-1
-        Mines are opposite to 1s, safe tiles are opposite to 2s
-        """
-        # Horizontal 1-2-2-1 pattern
-        for x in range(game.size_x):
-            for y in range(game.size_y - 3):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x][y + 1]
-                t3 = game.tiles[x][y + 2]
-                t4 = game.tiles[x][y + 3]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
-                        t3["state"] == STATE_CLICKED and t3["mines"] == 2 and
-                        t4["state"] == STATE_CLICKED and t4["mines"] == 1):
-
-                    # Check row above
-                    if x > 0:
-                        above_coords = [(x - 1, y), (x - 1, y + 1), (x - 1, y + 2), (x - 1, y + 3)]
-                        if self._check_tiles_in_line(game, above_coords):
-                            return ('flag', x - 1, y)  # Flag first mine
-
-                    # Check row below
-                    if x < game.size_x - 1:
-                        below_coords = [(x + 1, y), (x + 1, y + 1), (x + 1, y + 2), (x + 1, y + 3)]
-                        if self._check_tiles_in_line(game, below_coords):
-                            return ('flag', x + 1, y)  # Flag first mine
-
-        # Vertical 1-2-2-1 pattern
-        for y in range(game.size_y):
-            for x in range(game.size_x - 3):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x + 1][y]
-                t3 = game.tiles[x + 2][y]
-                t4 = game.tiles[x + 3][y]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
-                        t3["state"] == STATE_CLICKED and t3["mines"] == 2 and
-                        t4["state"] == STATE_CLICKED and t4["mines"] == 1):
-
-                    # Check column left
-                    if y > 0:
-                        left_coords = [(x, y - 1), (x + 1, y - 1), (x + 2, y - 1), (x + 3, y - 1)]
-                        if self._check_tiles_in_line(game, left_coords):
-                            return ('flag', x, y - 1)  # Flag first mine
-
-                    # Check column right
-                    if y < game.size_y - 1:
-                        right_coords = [(x, y + 1), (x + 1, y + 1), (x + 2, y + 1), (x + 3, y + 1)]
-                        if self._check_tiles_in_line(game, right_coords):
-                            return ('flag', x, y + 1)  # Flag first mine
-
-        return None
-
-    def _find_12_pattern(self, game):
-        """
-        Tìm 1-2 pattern followed by unknown tile.
-        In a 1-2-X pattern along edges, X is often a mine.
-        """
-        # Horizontal 1-2 pattern
-        for x in range(game.size_x):
-            for y in range(game.size_y - 2):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x][y + 1]
-                t_unknown = game.tiles[x][y + 2]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
-                        t_unknown["state"] == STATE_DEFAULT):
-
-                    # Check if this is near an edge or has specific neighbor patterns
-                    # For simplicity, flag the unknown tile in 1-2-X pattern
-                    if x == 0 or x == game.size_x - 1:  # Near top/bottom edge
-                        return ('flag', x, y + 2)
-
-        # Vertical 1-2 pattern
-        for y in range(game.size_y):
-            for x in range(game.size_x - 2):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x + 1][y]
-                t_unknown = game.tiles[x + 2][y]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 2 and
-                        t_unknown["state"] == STATE_DEFAULT):
-
-                    if y == 0 or y == game.size_y - 1:  # Near left/right edge
-                        return ('flag', x + 2, y)
-
-        return None
-
-    def _find_11_pattern(self, game):
-        """
-        Tìm 1-1 pattern near borders.
-        In a 1-1-X pattern near edges, X is often safe.
-        """
-        # Horizontal 1-1 pattern near edges
-        for x in range(game.size_x):
-            for y in range(game.size_y - 2):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x][y + 1]
-                t_unknown = game.tiles[x][y + 2]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 1 and
-                        t_unknown["state"] == STATE_DEFAULT):
-
-                    # Near edge, the third tile is often safe
-                    if x == 0 or x == game.size_x - 1:  # Near top/bottom edge
-                        return ('click', x, y + 2)
-
-        # Vertical 1-1 pattern near edges
-        for y in range(game.size_y):
-            for x in range(game.size_x - 2):
-                t1 = game.tiles[x][y]
-                t2 = game.tiles[x + 1][y]
-                t_unknown = game.tiles[x + 2][y]
-
-                if (t1["state"] == STATE_CLICKED and t1["mines"] == 1 and
-                        t2["state"] == STATE_CLICKED and t2["mines"] == 1 and
-                        t_unknown["state"] == STATE_DEFAULT):
-
-                    if y == 0 or y == game.size_y - 1:  # Near left/right edge
-                        return ('click', x + 2, y)
-
-        return None
-
-
 class AdvancedPatternStrategy(AIStrategy):
     """
     Advanced Pattern Recognition Strategy for Minesweeper
@@ -3195,7 +2703,7 @@ class AdvancedPatternStrategy(AIStrategy):
         return None
 
     def _check_diamond_pattern(self, game, center_x, center_y):
-        """Check diamond/cross patterns centered at position"""
+        """Check diamond/cross patterns centered at a position"""
 
         center_tile = game.tiles[center_x][center_y]
 
@@ -3477,8 +2985,8 @@ class AdvancedPatternStrategy(AIStrategy):
             return None
 
         # Extract mine counts and positions
-        mine_counts = [tile["mines"] for _, _, tile in numbered_tiles]
-        positions = [(x, y) for x, y, _ in numbered_tiles]
+        mine_counts = [tile["mines"] for tile in numbered_tiles]
+        positions = [(x, y) for x, y, tile in numbered_tiles]
 
         # Look for specific cluster patterns
         total_mines = sum(mine_counts)
@@ -3557,6 +3065,871 @@ THEMES = {
         "flag_color": "#0066cc"
     }
 }
+
+class MinefieldGenerator:
+    def __init__(self):
+        self.saved_maps = {}
+
+    def generate_maps(self, difficulty, count=100, seed=None):
+        """Generate multiple minefield maps for a specific difficulty"""
+        if seed is not None:
+            random.seed(seed)
+
+        maps = []
+        for i in range(count):
+            config = DIFFICULTIES[difficulty]
+            size_x, size_y, mines = config["size_x"], config["size_y"], config["mines"]
+
+            # Generate mine positions
+            mine_positions = set()
+            while len(mine_positions) < mines:
+                x = random.randint(0, size_x - 1)
+                y = random.randint(0, size_y - 1)
+                mine_positions.add((x, y))
+
+            # Create map with mine counts
+            mine_map = {
+                "difficulty": difficulty,
+                "size_x": size_x,
+                "size_y": size_y,
+                "total_mines": mines,
+                "mines": list(mine_positions),
+                "id": f"{difficulty}_{i}"
+            }
+            maps.append(mine_map)
+
+        self.saved_maps[difficulty] = maps
+        return maps
+
+    def save_maps(self, filename="minefields.json"):
+        """Save all generated maps to a JSON file"""
+        with open(filename, "w") as f:
+            json.dump(self.saved_maps, f, indent=2)
+
+    def load_maps(self, filename="minefields.json"):
+        """Load maps from a JSON file"""
+        try:
+            with open(filename, "r") as f:
+                self.saved_maps = json.load(f)
+            return True
+        except FileNotFoundError:
+            print(f"File {filename} not found")
+            return False
+        except json.JSONDecodeError:
+            print(f"Error reading JSON from {filename}")
+            return False
+
+
+class HeadlessMinesweeper:
+    """A version of Minesweeper without UI for strategy testing"""
+
+    def __init__(self, mine_map):
+        self.size_x = mine_map["size_x"]
+        self.size_y = mine_map["size_y"]
+        self.total_mines = mine_map["total_mines"]
+        self.mine_positions = set(tuple(pos) for pos in mine_map["mines"])
+
+        # Initialize game state
+        self.game_over_flag = False
+        self.won = False
+        self.moves = []
+        self.first_click = True
+        self.clicked_count = 0
+        self.flag_count = 0
+        self.correct_flag_count = 0
+
+        # Create tiles
+        self.tiles = {}
+        for x in range(self.size_x):
+            self.tiles[x] = {}
+            for y in range(self.size_y):
+                self.tiles[x][y] = {
+                    "coords": {"x": x, "y": y},
+                    "is_mine": (x, y) in self.mine_positions,
+                    "state": STATE_DEFAULT,
+                    "mines": 0  # Will be calculated
+                }
+
+        # Calculate numbers for tiles
+        for x in range(self.size_x):
+            for y in range(self.size_y):
+                if not self.tiles[x][y]["is_mine"]:
+                    mine_count = sum(1 for nx, ny in self.get_neighbors_coords(x, y)
+                                     if (nx, ny) in self.mine_positions)
+                    self.tiles[x][y]["mines"] = mine_count
+
+    def get_neighbors_coords(self, x, y):
+        """Get coordinates of neighboring tiles"""
+        coords = []
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.size_x and 0 <= ny < self.size_y:
+                    coords.append((nx, ny))
+        return coords
+
+    def get_neighbors(self, x, y):
+        """Get neighboring tile objects"""
+        return [self.tiles[nx][ny] for nx, ny in self.get_neighbors_coords(x, y)]
+
+    def process_move(self, move_type, x, y):
+        """Process a move (click or flag)"""
+        if self.game_over_flag:
+            return False
+
+        self.moves.append((move_type, x, y))
+
+        if move_type == "click":
+            return self.click(x, y)
+        elif move_type == "flag":
+            return self.flag(x, y)
+        return False
+
+    def click(self, x, y):
+        """Process a click at coordinates x,y"""
+        if not (0 <= x < self.size_x and 0 <= y < self.size_y):
+            return False
+
+        tile = self.tiles[x][y]
+
+        if self.game_over_flag or tile["state"] != STATE_DEFAULT:
+            return False
+
+        # Check if mine
+        if tile["is_mine"]:
+            self.game_over_flag = True
+            return False
+
+        # Reveal tile
+        if tile["mines"] == 0:
+            self.clear_surrounding_tiles((x, y))
+        else:
+            tile["state"] = STATE_CLICKED
+            self.clicked_count += 1
+
+        # Check win condition
+        if self.clicked_count == (self.size_x * self.size_y) - self.total_mines:
+            self.game_over_flag = True
+            self.won = True
+            return True
+
+        return True
+
+    def flag(self, x, y):
+        """Process a flag at coordinates x,y"""
+        if not (0 <= x < self.size_x and 0 <= y < self.size_y):
+            return False
+
+        tile = self.tiles[x][y]
+
+        if self.game_over_flag or tile["state"] == STATE_CLICKED:
+            return False
+
+        if tile["state"] == STATE_DEFAULT:
+            # Flag tile
+            tile["state"] = STATE_FLAGGED
+            self.flag_count += 1
+            if tile["is_mine"]:
+                self.correct_flag_count += 1
+        else:  # STATE_FLAGGED
+            # Unflag tile
+            tile["state"] = STATE_DEFAULT
+            self.flag_count -= 1
+            if tile["is_mine"]:
+                self.correct_flag_count -= 1
+
+        return True
+
+    def clear_surrounding_tiles(self, start_coords):
+        """Clear surrounding empty tiles (BFS)"""
+        queue = deque([start_coords])
+        visited = set()
+
+        while queue:
+            x, y = queue.popleft()
+            if (x, y) in visited:
+                continue
+
+            visited.add((x, y))
+            tile = self.tiles[x][y]
+
+            if tile["state"] != STATE_DEFAULT:
+                continue
+
+            tile["state"] = STATE_CLICKED
+            self.clicked_count += 1
+
+            # If empty tile, add neighbors to queue
+            if tile["mines"] == 0:
+                for nx, ny in self.get_neighbors_coords(x, y):
+                    queue.append((nx, ny))
+
+
+class StrategyBenchmark:
+    """Benchmark different AI strategies on the same minefield maps"""
+
+    def __init__(self):
+        self.generator = MinefieldGenerator()
+        self.results = {}
+
+    def prepare_maps(self, difficulty="Beginner", count=100, seed=None, load_file=None):
+        """Prepare maps for benchmarking"""
+        if load_file:
+            success = self.generator.load_maps(load_file)
+            if not success:
+                print(f"Failed to load {load_file}, generating new maps instead")
+                self.generator.generate_maps(difficulty, count, seed)
+        else:
+            self.generator.generate_maps(difficulty, count, seed)
+
+        return self.generator.saved_maps
+
+    def run_benchmark(self, difficulty="Beginner", strategies=None):
+        """Run benchmark on all maps for given strategies"""
+        if strategies is None:
+            strategies = STRATEGIES
+
+        # Filter out None strategies
+        valid_strategies = {name: cls for name, cls in strategies.items() if cls is not None}
+        if not valid_strategies:
+            print("No valid strategies found!")
+            return {}
+
+        maps = self.generator.saved_maps.get(difficulty, [])
+        if not maps:
+            print(f"No maps found for difficulty {difficulty}")
+            return {}
+
+        results = {}
+        total_maps = len(maps)
+
+        for strategy_name, strategy_class in valid_strategies.items():
+            print(f"\nRunning {strategy_name} strategy on {total_maps} {difficulty} maps...")
+            strategy_results = []
+            wins = 0
+            total_moves = 0
+            total_time = 0
+            total_flags = 0
+            total_correct_flags = 0
+
+            # Create progress indicator
+            for i, mine_map in enumerate(maps):
+                # Update progress in real-time
+                progress = f"[{i + 1}/{total_maps}]"
+                if i > 0:  # Avoid division by zero
+                    avg_moves_so_far = total_moves / i
+                    print(f"\r{progress} Testing {strategy_name}: {wins}/{i} wins, avg moves: {avg_moves_so_far:.1f}",
+                          end="", flush=True)
+
+                # Run strategy on map
+                result = self._test_strategy_on_map(strategy_class, mine_map, progress)
+                strategy_results.append(result)
+
+                # Update running statistics
+                if result["won"]:
+                    wins += 1
+                total_moves += len(result["moves"])
+                total_time += result["time"]
+                total_flags += result["flagged"]
+                total_correct_flags += result["correct_flag_count"]
+
+            # Finalize results for this strategy
+            avg_moves = total_moves / len(strategy_results) if strategy_results else 0
+            avg_time = total_time / len(strategy_results) if strategy_results else 0
+            avg_flags = total_flags / len(strategy_results) if strategy_results else 0
+            flag_accuracy = total_correct_flags / total_flags if total_flags > 0 else 0
+
+            results[strategy_name] = {
+                "wins": wins,
+                "games": len(strategy_results),
+                "avg_moves": avg_moves,
+                "avg_time": avg_time,
+                "avg_flags": avg_flags,
+                "flag_accuracy": flag_accuracy,
+                "win_rate": wins / len(strategy_results) if strategy_results else 0,
+                "details": strategy_results
+            }
+
+            # Print final result with newline
+            print(f"\r{strategy_name} complete: {wins}/{total_maps} wins ({wins / total_maps * 100:.1f}%), "
+                  f"avg moves: {avg_moves:.1f}, avg flags: {avg_flags:.1f} (acc: {flag_accuracy:.1%})  ")
+
+        self.results[difficulty] = results
+        return results
+
+    def _test_strategy_on_map(self, strategy_class, mine_map, progress=""):
+        """Test a single strategy on a single map"""
+        try:
+            game = HeadlessMinesweeper(mine_map)
+            strategy = strategy_class()
+
+            start_time = time.time()
+            move_count = 0
+
+            # First move is always in the center for consistency
+            center_x, center_y = game.size_x // 2, game.size_y // 2
+            success = game.process_move("click", center_x, center_y)
+            move_count += 1
+
+            # If first move hit a mine, return early
+            if not success:
+                elapsed = time.time() - start_time
+                return {
+                    "won": False,
+                    "moves": game.moves,
+                    "time": elapsed,
+                    "flagged": game.flag_count,
+                    "correct_flag_count": game.correct_flag_count
+                }
+
+            # Run strategy until game over or move limit reached
+            max_moves = game.size_x * game.size_y * 2  # Reasonable upper limit
+            while not game.game_over_flag and move_count < max_moves:
+                try:
+                    move = strategy.next_move(game)
+                    if move is None:
+                        break
+
+                    # Validate move format
+                    if not isinstance(move, (list, tuple)) or len(move) != 3:
+                        print(f"Invalid move format from {strategy.__class__.__name__}: {move}")
+                        break
+
+                    move_type, x, y = move
+                    if move_type not in ["click", "flag"]:
+                        print(f"Invalid move type: {move_type}")
+                        break
+
+                    success = game.process_move(move_type, x, y)
+                    move_count += 1
+
+                    # If move failed, strategy might be stuck
+                    if not success and move_type == "click":
+                        break
+
+                except Exception as e:
+                    print(f"Error in strategy {strategy.__class__.__name__}: {e}")
+                    break
+
+            elapsed = time.time() - start_time
+
+            return {
+                "won": game.won,
+                "moves": game.moves,
+                "time": elapsed,
+                "flagged": game.flag_count,
+                "correct_flag_count": game.correct_flag_count
+            }
+
+        except Exception as e:
+            print(f"Error testing strategy on map: {e}")
+            return {
+                "won": False,
+                "moves": [],
+                "time": 0.0,
+                "flagged": 0,
+                "correct_flag_count": 0
+            }
+
+    def save_results(self, filename="benchmark_results.json"):
+        """Save benchmark results to file"""
+        try:
+            with open(filename, "w") as f:
+                json.dump(self.results, f, indent=2)
+            print(f"Results saved to {filename}")
+        except Exception as e:
+            print(f"Error saving results: {e}")
+
+    def print_summary(self):
+        """Print summary of benchmark results"""
+        for difficulty, results in self.results.items():
+            print(f"\n=== {difficulty} ===")
+            # Sort by win rate, then by average moves
+            sorted_results = sorted(
+                results.items(),
+                key=lambda x: (x[1]["win_rate"], -x[1]["avg_moves"]),
+                reverse=True
+            )
+
+            for strategy, data in sorted_results:
+                print(f"{strategy}:")
+                print(f"  Win rate: {data['win_rate']:.2%} ({data['wins']}/{data['games']})")
+                print(f"  Avg moves: {data['avg_moves']:.2f}")
+                print(f"  Avg time: {data['avg_time']:.3f}s")
+                if data['avg_flags'] > 0:
+                    print(f"  Avg flags: {data['avg_flags']:.2f} (accuracy: {data['flag_accuracy']:.1%})")
+
+
+def run_benchmark_cli():
+    """Command-line interface for running benchmarks"""
+    benchmark = StrategyBenchmark()
+
+    # Ask for configuration
+    print("===== Minesweeper AI Strategy Benchmark =====")
+    print("1. Generate new maps")
+    print("2. Load existing maps")
+    choice = input("Choose option (1-2): ")
+
+    if choice not in ["1", "2"]:
+        print("Invalid choice. Please enter 1 or 2.")
+        return
+
+    if choice == "1":
+        print("\nDifficulty levels:")
+        print("1. Beginner")
+        print("2. Intermediate")
+        print("3. Expert")
+
+        difficulty_input = input("Select difficulty (1-3) [1]: ") or "1"
+
+        difficulty_map = {
+            "1": "Beginner",
+            "2": "Intermediate",
+            "3": "Expert"
+        }
+
+        if difficulty_input not in difficulty_map:
+            print(f"Invalid difficulty choice '{difficulty_input}'. Please enter 1, 2, or 3.")
+            return
+
+        difficulty = difficulty_map[difficulty_input]
+        print(f"Selected: {difficulty}")
+
+        count = int(input("Number of maps [100]: ") or "100")
+        seed = input("Random seed (leave empty for random): ")
+        seed = int(seed) if seed else None
+
+        print(f"Generating {count} maps for {difficulty}...")
+        benchmark.prepare_maps(difficulty, count, seed)
+
+        save_maps = input("Save generated maps? (y/n) [y]: ").lower() != "n"
+        if save_maps:
+            filename = input("Filename [minefields.json]: ") or "minefields.json"
+            benchmark.generator.save_maps(filename)
+            print(f"Maps saved to {filename}")
+    else:
+        filename = input("Maps filename [minefields.json]: ") or "minefields.json"
+        if benchmark.generator.load_maps(filename):
+            print(f"Maps loaded from {filename}")
+            difficulties = list(benchmark.generator.saved_maps.keys())
+            print(f"Available difficulties: {', '.join(difficulties)}")
+
+            # Create mapping for available difficulties
+            if difficulties:
+                print("\nSelect difficulty:")
+                for i, diff in enumerate(difficulties, 1):
+                    print(f"{i}. {diff}")
+
+                diff_input = input(f"Choose difficulty (1-{len(difficulties)}) [1]: ") or "1"
+
+                try:
+                    diff_index = int(diff_input) - 1
+                    if 0 <= diff_index < len(difficulties):
+                        difficulty = difficulties[diff_index]
+                        print(f"Selected: {difficulty}")
+                    else:
+                        print(
+                            f"Invalid choice '{diff_input}'. Please enter a number between 1 and {len(difficulties)}.")
+                        return
+                except ValueError:
+                    print(f"Invalid input '{diff_input}'. Please enter a number.")
+                    return
+            else:
+                difficulty = "Beginner"
+        else:
+            print(f"Could not load {filename}. Generating new Beginner maps...")
+            difficulty = "Beginner"
+            count = 100
+            benchmark.prepare_maps(difficulty, count)
+
+    # Select strategies
+    available_strategies = [name for name, cls in STRATEGIES.items() if cls is not None]
+    if not available_strategies:
+        print("No strategies available! Please add strategy classes to the STRATEGIES dictionary.")
+        return
+
+    print(f"\nAvailable strategies:")
+    for i, strategy in enumerate(available_strategies, 1):
+        print(f"{i}. {strategy}")
+    print("Enter strategy numbers (e.g., '1,3' or '1-3' for range) or press Enter for all:")
+
+    strategy_input = input("Strategy selection: ").strip()
+
+    if not strategy_input:
+        # Select all strategies
+        selected_strategies = {name: cls for name, cls in STRATEGIES.items() if cls is not None}
+        print("Selected: All strategies")
+    else:
+        selected_strategies = {}
+
+        try:
+            # Parse input - support both comma-separated and ranges
+            selections = []
+            for part in strategy_input.split(','):
+                part = part.strip()
+                if '-' in part:
+                    # Handle range like "1-3"
+                    start, end = map(int, part.split('-'))
+                    selections.extend(range(start, end + 1))
+                else:
+                    # Handle single number
+                    selections.append(int(part))
+
+            # Validate and convert to strategy names
+            for num in selections:
+                if 1 <= num <= len(available_strategies):
+                    strategy_name = available_strategies[num - 1]
+                    selected_strategies[strategy_name] = STRATEGIES[strategy_name]
+                else:
+                    print(
+                        f"Invalid strategy number '{num}'. Please enter numbers between 1 and {len(available_strategies)}.")
+                    return
+
+            if selected_strategies:
+                print(f"Selected: {', '.join(selected_strategies.keys())}")
+            else:
+                print("No valid strategies selected!")
+                return
+
+        except ValueError:
+            print("Invalid input format. Use numbers separated by commas (e.g., '1,2,3') or ranges (e.g., '1-3').")
+            return
+
+    # Run benchmark
+    print(f"\nRunning benchmark for {len(selected_strategies)} strategies on {difficulty}...")
+    benchmark.run_benchmark(difficulty, selected_strategies)
+
+    # Show results
+    benchmark.print_summary()
+
+    # Save results
+    save_results = input("\nSave benchmark results? (y/n) [y]: ").lower() != "n"
+    if save_results:
+        filename = input("Results filename [benchmark_results.json]: ") or "benchmark_results.json"
+        benchmark.save_results(filename)
+
+    generate_graphs = input("Generate graphs from results? (y/n) [y]: ").lower() != "n"
+    if generate_graphs:
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            from matplotlib.patches import Rectangle
+            import seaborn as sns
+
+            # Set style for better looking plots
+            plt.style.use('default')
+            sns.set_palette("husl")
+
+            for difficulty, results in benchmark.results.items():
+                strategies = list(results.keys())
+                n_strategies = len(strategies)
+
+                # Extract all metrics
+                win_rates = [results[s]["win_rate"] * 100 for s in strategies]
+                avg_moves = [results[s]["avg_moves"] for s in strategies]
+                avg_time = [results[s]["avg_time"] * 1000 for s in strategies]  # Convert to ms
+                avg_flags = [results[s]["avg_flags"] for s in strategies]
+                flag_accuracy = [results[s]["flag_accuracy"] * 100 for s in strategies]
+                games_played = [results[s]["games"] for s in strategies]
+                wins = [results[s]["wins"] for s in strategies]
+
+                # Create a comprehensive dashboard
+                fig = plt.figure(figsize=(20, 16))
+                fig.suptitle(f'Minesweeper AI Strategy Benchmark - {difficulty}', fontsize=24, fontweight='bold')
+
+                # Color palette
+                colors = plt.cm.Set3(np.linspace(0, 1, n_strategies))
+
+                # 1. Win Rate Comparison (Top Left)
+                ax1 = plt.subplot(3, 3, 1)
+                bars1 = ax1.bar(range(n_strategies), win_rates, color=colors, alpha=0.8, edgecolor='black',
+                                linewidth=0.5)
+                ax1.set_title('Win Rate Comparison', fontsize=14, fontweight='bold')
+                ax1.set_ylabel('Win Rate (%)', fontsize=12)
+                ax1.set_xticks(range(n_strategies))
+                ax1.set_xticklabels(strategies, rotation=45, ha='right')
+                ax1.set_ylim(0, 105)
+                ax1.grid(True, alpha=0.3)
+
+                # Add value labels
+                for i, (bar, rate) in enumerate(zip(bars1, win_rates)):
+                    ax1.text(i, rate + 1, f'{rate:.1f}%', ha='center', va='bottom', fontweight='bold')
+
+                # 2. Average Moves vs Win Rate Scatter (Top Middle)
+                ax2 = plt.subplot(3, 3, 2)
+                scatter = ax2.scatter(avg_moves, win_rates, c=colors, s=200, alpha=0.7, edgecolors='black')
+                ax2.set_title('Efficiency vs Success', fontsize=14, fontweight='bold')
+                ax2.set_xlabel('Average Moves')
+                ax2.set_ylabel('Win Rate (%)')
+                ax2.grid(True, alpha=0.3)
+
+                # Add strategy labels
+                for i, strategy in enumerate(strategies):
+                    ax2.annotate(strategy, (avg_moves[i], win_rates[i]),
+                                 xytext=(5, 5), textcoords='offset points', fontsize=8)
+
+                # 3. Performance Time Distribution (Top Right)
+                ax3 = plt.subplot(3, 3, 3)
+                bars3 = ax3.bar(range(n_strategies), avg_time, color=colors, alpha=0.8, edgecolor='black',
+                                linewidth=0.5)
+                ax3.set_title('Average Response Time', fontsize=14, fontweight='bold')
+                ax3.set_ylabel('Time (ms)')
+                ax3.set_xticks(range(n_strategies))
+                ax3.set_xticklabels(strategies, rotation=45, ha='right')
+                ax3.grid(True, alpha=0.3)
+
+                for i, (bar, time) in enumerate(zip(bars3, avg_time)):
+                    ax3.text(i, time + max(avg_time) * 0.01, f'{time:.1f}ms', ha='center', va='bottom', fontsize=8)
+
+                # 4. Flagging Behavior (Middle Left)
+                ax4 = plt.subplot(3, 3, 4)
+                x = np.arange(n_strategies)
+                width = 0.35
+
+                bars4a = ax4.bar(x - width / 2, avg_flags, width, label='Avg Flags Used', color='lightcoral', alpha=0.8)
+                bars4b = ax4.bar(x + width / 2, [f * a / 100 for f, a in zip(avg_flags, flag_accuracy)],
+                                 width, label='Correct Flags', color='darkred', alpha=0.8)
+
+                ax4.set_title('Flagging Strategy Analysis', fontsize=14, fontweight='bold')
+                ax4.set_ylabel('Number of Flags')
+                ax4.set_xticks(x)
+                ax4.set_xticklabels(strategies, rotation=45, ha='right')
+                ax4.legend()
+                ax4.grid(True, alpha=0.3)
+
+                # 5. Win/Loss Ratio Pie Charts (Middle Center)
+                ax5 = plt.subplot(3, 3, 5)
+                if len(strategies) == 1:
+                    # Single strategy pie chart
+                    strategy = strategies[0]
+                    wins_val = wins[0]
+                    losses = games_played[0] - wins_val
+                    ax5.pie([wins_val, losses], labels=['Wins', 'Losses'], autopct='%1.1f%%',
+                            colors=['lightgreen', 'lightcoral'])
+                    ax5.set_title(f'{strategy}\nWin/Loss Distribution', fontsize=12, fontweight='bold')
+                else:
+                    # Multiple strategies comparison
+                    ax5.bar(range(n_strategies), wins, color='lightgreen', alpha=0.8, label='Wins')
+                    ax5.bar(range(n_strategies), [g - w for g, w in zip(games_played, wins)],
+                            bottom=wins, color='lightcoral', alpha=0.8, label='Losses')
+                    ax5.set_title('Win/Loss Distribution', fontsize=14, fontweight='bold')
+                    ax5.set_ylabel('Number of Games')
+                    ax5.set_xticks(range(n_strategies))
+                    ax5.set_xticklabels(strategies, rotation=45, ha='right')
+                    ax5.legend()
+
+                # 6. Performance Radar Chart (Middle Right)
+                ax6 = plt.subplot(3, 3, 6, projection='polar')
+
+                # Normalize metrics for radar chart (0-100 scale)
+                metrics = []
+                labels = ['Win Rate', 'Speed\n(inv time)', 'Efficiency\n(inv moves)', 'Flag Accuracy']
+
+                for i in range(n_strategies):
+                    strategy_metrics = [
+                        win_rates[i],  # Already 0-100
+                        100 - min(100, (avg_time[i] / max(avg_time)) * 100) if max(avg_time) > 0 else 100,
+                        # Invert time
+                        100 - min(100, (avg_moves[i] / max(avg_moves)) * 100) if max(avg_moves) > 0 else 100,
+                        # Invert moves
+                        flag_accuracy[i] if avg_flags[i] > 0 else 50  # Flag accuracy or neutral
+                    ]
+                    metrics.append(strategy_metrics)
+
+                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+                angles += angles[:1]  # Complete the circle
+
+                for i, (strategy, strategy_metrics) in enumerate(zip(strategies, metrics)):
+                    strategy_metrics += strategy_metrics[:1]  # Complete the circle
+                    ax6.plot(angles, strategy_metrics, 'o-', linewidth=2, label=strategy, color=colors[i])
+                    ax6.fill(angles, strategy_metrics, alpha=0.1, color=colors[i])
+
+                ax6.set_xticks(angles[:-1])
+                ax6.set_xticklabels(labels)
+                ax6.set_ylim(0, 100)
+                ax6.set_title('Performance Radar', fontsize=14, fontweight='bold', pad=20)
+                ax6.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
+                ax6.grid(True)
+
+                # 7. Move Distribution Box Plot (Bottom Left)
+                ax7 = plt.subplot(3, 3, 7)
+
+                # Extract move counts for each strategy
+                move_data = []
+                for strategy in strategies:
+                    strategy_moves = [len(game_result["moves"]) for game_result in results[strategy]["details"]]
+                    move_data.append(strategy_moves)
+
+                bp = ax7.boxplot(move_data, tick_labels=strategies, patch_artist=True)
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+
+                ax7.set_title('Move Count Distribution', fontsize=14, fontweight='bold')
+                ax7.set_ylabel('Number of Moves')
+                ax7.set_xticklabels(strategies, rotation=45, ha='right')
+                ax7.grid(True, alpha=0.3)
+
+                # 8. Performance Heatmap (Bottom Center)
+                ax8 = plt.subplot(3, 3, 8)
+
+                # Create performance matrix
+                performance_metrics = np.array([
+                    win_rates,
+                    [100 - min(100, (t / max(avg_time)) * 100) if max(avg_time) > 0 else 100 for t in avg_time],
+                    [100 - min(100, (m / max(avg_moves)) * 100) if max(avg_moves) > 0 else 100 for m in avg_moves],
+                    flag_accuracy
+                ])
+
+                im = ax8.imshow(performance_metrics, cmap='RdYlGn', aspect='auto', vmin=0, vmax=100)
+                ax8.set_xticks(range(n_strategies))
+                ax8.set_xticklabels(strategies, rotation=45, ha='right')
+                ax8.set_yticks(range(len(labels)))
+                ax8.set_yticklabels(labels)
+                ax8.set_title('Performance Heatmap', fontsize=14, fontweight='bold')
+
+                # Add text annotations
+                for i in range(len(labels)):
+                    for j in range(n_strategies):
+                        text = ax8.text(j, i, f'{performance_metrics[i, j]:.1f}',
+                                        ha="center", va="center", color="black", fontweight='bold')
+
+                # Add colorbar
+                cbar = plt.colorbar(im, ax=ax8, shrink=0.8)
+                cbar.set_label('Performance Score', rotation=270, labelpad=20)
+
+                # 9. Strategy Rankings (Bottom Right)
+                ax9 = plt.subplot(3, 3, 9)
+
+                # Calculate overall score (weighted combination)
+                overall_scores = []
+                weights = {'win_rate': 0.4, 'moves': 0.2, 'time': 0.2, 'flags': 0.2}
+
+                for i in range(n_strategies):
+                    score = (
+                            win_rates[i] * weights['win_rate'] +
+                            (100 - min(100, (avg_time[i] / max(avg_time)) * 100) if max(avg_time) > 0 else 100) *
+                            weights['time'] +
+                            (100 - min(100, (avg_moves[i] / max(avg_moves)) * 100) if max(avg_moves) > 0 else 100) *
+                            weights['moves'] +
+                            (flag_accuracy[i] if avg_flags[i] > 0 else 50) * weights['flags']
+                    )
+                    overall_scores.append(score)
+
+                # Sort by overall score
+                sorted_indices = sorted(range(n_strategies), key=lambda x: overall_scores[x], reverse=True)
+                sorted_strategies = [strategies[i] for i in sorted_indices]
+                sorted_scores = [overall_scores[i] for i in sorted_indices]
+
+                bars9 = ax9.barh(range(n_strategies), sorted_scores,
+                                 color=[colors[strategies.index(s)] for s in sorted_strategies],
+                                 alpha=0.8, edgecolor='black', linewidth=0.5)
+                ax9.set_yticks(range(n_strategies))
+                ax9.set_yticklabels(sorted_strategies)
+                ax9.set_xlabel('Overall Performance Score')
+                ax9.set_title('Strategy Rankings', fontsize=14, fontweight='bold')
+                ax9.grid(True, alpha=0.3)
+
+                # Add score labels
+                for i, (bar, score) in enumerate(zip(bars9, sorted_scores)):
+                    ax9.text(score + 1, i, f'{score:.1f}', ha='left', va='center', fontweight='bold')
+
+                plt.tight_layout()
+                plt.savefig(f'comprehensive_analysis_{difficulty}.png', dpi=300, bbox_inches='tight',
+                            facecolor='white', edgecolor='none')
+                plt.close()
+
+                # Additional detailed plots for each strategy
+                for strategy_name, strategy_data in results.items():
+                    if len(strategy_data["details"]) > 1:  # Only if we have multiple games
+                        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+                        fig.suptitle(f'{strategy_name} - Detailed Analysis ({difficulty})',
+                                     fontsize=16, fontweight='bold')
+
+                        # Game-by-game performance
+                        game_moves = [len(game["moves"]) for game in strategy_data["details"]]
+                        game_results = [1 if game["won"] else 0 for game in strategy_data["details"]]
+                        game_times = [game["time"] * 1000 for game in strategy_data["details"]]
+                        game_flags = [game["flagged"] for game in strategy_data["details"]]
+
+                        # 1. Moves per game
+                        ax1.plot(game_moves, 'b-', alpha=0.7, linewidth=1)
+                        ax1.scatter(range(len(game_moves)), game_moves,
+                                    c=['green' if w else 'red' for w in game_results],
+                                    alpha=0.6, s=30)
+                        ax1.set_title('Moves per Game')
+                        ax1.set_xlabel('Game Number')
+                        ax1.set_ylabel('Number of Moves')
+                        ax1.grid(True, alpha=0.3)
+                        ax1.axhline(y=np.mean(game_moves), color='orange', linestyle='--',
+                                    label=f'Average: {np.mean(game_moves):.1f}')
+                        ax1.legend()
+
+                        # 2. Time performance
+                        ax2.hist(game_times, bins=20, alpha=0.7, color='lightblue', edgecolor='black')
+                        ax2.set_title('Response Time Distribution')
+                        ax2.set_xlabel('Time per Game (ms)')
+                        ax2.set_ylabel('Frequency')
+                        ax2.axvline(x=np.mean(game_times), color='red', linestyle='--',
+                                    label=f'Mean: {np.mean(game_times):.1f}ms')
+                        ax2.grid(True, alpha=0.3)
+                        ax2.legend()
+
+                        # 3. Win streak analysis
+                        win_streaks = []
+                        current_streak = 0
+                        for result in game_results:
+                            if result:
+                                current_streak += 1
+                            else:
+                                if current_streak > 0:
+                                    win_streaks.append(current_streak)
+                                current_streak = 0
+                        if current_streak > 0:
+                            win_streaks.append(current_streak)
+
+                        if win_streaks:
+                            ax3.hist(win_streaks, bins=max(1, len(set(win_streaks))),
+                                     alpha=0.7, color='lightgreen', edgecolor='black')
+                            ax3.set_title('Win Streak Distribution')
+                            ax3.set_xlabel('Consecutive Wins')
+                            ax3.set_ylabel('Frequency')
+                        else:
+                            ax3.text(0.5, 0.5, 'No Win Streaks', ha='center', va='center',
+                                     transform=ax3.transAxes, fontsize=14)
+                            ax3.set_title('Win Streak Distribution')
+                        ax3.grid(True, alpha=0.3)
+
+                        # 4. Flagging behavior over time
+                        ax4.scatter(range(len(game_flags)), game_flags,
+                                    c=['green' if w else 'red' for w in game_results], alpha=0.6)
+                        ax4.set_title('Flagging Behavior')
+                        ax4.set_xlabel('Game Number')
+                        ax4.set_ylabel('Flags Used')
+                        ax4.grid(True, alpha=0.3)
+                        if game_flags:
+                            ax4.axhline(y=np.mean(game_flags), color='orange', linestyle='--',
+                                        label=f'Average: {np.mean(game_flags):.1f}')
+                            ax4.legend()
+
+                        plt.tight_layout()
+                        plt.savefig(f'{strategy_name}_{difficulty}_detailed.png', dpi=300, bbox_inches='tight')
+                        plt.close()
+
+            print("Comprehensive graphs generated and saved as PNG files.")
+            print("Generated files:")
+            print("- comprehensive_analysis_[difficulty].png (main dashboard)")
+            print("- [strategy]_[difficulty]_detailed.png (individual strategy analysis)")
+
+        except ImportError:
+            print("matplotlib and/or seaborn not installed. Skipping graph generation.")
+            print("Install with: pip install matplotlib seaborn")
+        except Exception as e:
+            print(f"Error generating graphs: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class Settings:
@@ -3870,7 +4243,6 @@ class Minesweeper:
         self.tk.bind("<F6>", lambda e: self.change_strategy())
         self.tk.bind("<F5>", lambda e: self.auto_play())
 
-
     def change_strategy(self):
         """Change the AI strategy based on the selected option."""
         strategy_class = STRATEGIES[self.strategy_name.get()]
@@ -3934,12 +4306,13 @@ class Minesweeper:
         self.strategy_btn.pack(side="left", padx=(10, 0))
 
         self.auto_play_btn = Button(self.bottom_frame, text="Auto Play", command=self.toggle_auto_play,
-                            font=("Arial", 10), padx=10, width=20)  # Add fixed width
+                                    font=("Arial", 10), padx=10, width=20)  # Add fixed width
         self.auto_play_btn.pack(side="left", padx=(10, 0))
 
         # AI status
         self.ai_running = False
-        self.ai_status_label = Label(self.bottom_frame, text="AI: Stopped", font=("Arial", 10), width=15)  # Add fixed width
+        self.ai_status_label = Label(self.bottom_frame, text="AI: Stopped", font=("Arial", 10),
+                                     width=15)  # Add fixed width
         self.ai_status_label.pack(side="left", padx=(10, 0))
 
         # Difficulty label
@@ -4302,7 +4675,7 @@ class Minesweeper:
         # Stop AI if running
         if self.ai_running:
             self.ai_running = False
-            self.auto_play_btn.config(  text="Auto Play  ")
+            self.auto_play_btn.config(text="Auto Play  ")
             self.ai_status_label.config(text="AI: Stopped")
 
         # Record statistics
@@ -4489,6 +4862,10 @@ class Minesweeper:
 
 
 def main():
+    # Check for command line arguments
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        run_benchmark_cli()
+        return
     # Create main window
     window = Tk()
     window.title("Minesweeper")
