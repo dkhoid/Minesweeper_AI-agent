@@ -1,11 +1,10 @@
 This is a **Minesweeper application with AI** written in Python + Tkinter, featuring multiple strategies:
 
-* **RandomStrategy** (random selection)
-* **AutoOpenStrategy** (based on basic open/flag rules)
-* **ProbabilisticStrategy** (estimating mine probabilities)
-* **CSPStrategy** (Constraint Satisfaction Problem – constraint propagation + backtracking)
-* **HybridStrategy** (hybrid: deterministic + CSP + probabilistic + pattern recognition)
-* **BasicPatternStrategy** (based on recognizing common patterns: 1-2-1, 1-2-2-1, 1-2, 1-1)
+* **Basic Strategy** (based on basic open/flag rules + pattern recognition)
+* **Probabilistic Strategy** (estimating mine probabilities)
+* **CSP Strategy** (Constraint Satisfaction Problem – constraint propagation + backtracking)
+* **Hybrid Strategy** (hybrid: deterministic + CSP + probabilistic + pattern recognition)
+* **CNN Strategy** (Convolutional Neural Network-based pattern recognition)
 
 The application also includes:
 

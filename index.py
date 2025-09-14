@@ -3,15 +3,52 @@ import os
 import platform
 import random
 import time
-import copy
 import sys
+import numpy as np
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections import deque
 from datetime import datetime
 from tkinter import *
 from tkinter import ttk
-from typing import Optional, Tuple
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+HAS_TENSORFLOW = False
+tf = None
+keras = None
+layers = None
+
+def load_tensorflow():
+    """Lazy load TensorFlow only when needed"""
+    global HAS_TENSORFLOW, tf, keras, layers
+    if not HAS_TENSORFLOW and tf is None:
+        try:
+            print("Loading TensorFlow... (this may take a moment)")
+            import tensorflow as tf_module
+            from tensorflow import keras as keras_module  
+            from tensorflow.keras import layers as layers_module
+            
+            # Configure TensorFlow for faster loading
+            tf_module.config.set_soft_device_placement(True)
+            
+            # Set CPU only
+            tf_module.config.set_visible_devices([], 'GPU')
+            
+            tf = tf_module
+            keras = keras_module
+            layers = layers_module
+            HAS_TENSORFLOW = True
+            print("TensorFlow loaded successfully!")
+            
+        except ImportError:
+            print("TensorFlow not found. CNN will use pattern-based fallback.")
+            HAS_TENSORFLOW = False
+    
+    return HAS_TENSORFLOW
+
+
 
 # Difficulty settings
 DIFFICULTIES = {
@@ -60,15 +97,6 @@ class MinesweeperAI:
         self.actions_taken = []
 
 
-class RandomStrategy(AIStrategy):
-    def next_move(self, game):
-        # Randomly select a tile to click
-        unclicked_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
-                           if game.tiles[x][y]["state"] == STATE_DEFAULT]
-        if unclicked_tiles:
-            x, y = random.choice(unclicked_tiles)
-            return ('click', x, y)
-        return None
 
 
 class AutoOpenStrategy(AIStrategy):
@@ -110,7 +138,7 @@ class AutoOpenStrategy(AIStrategy):
         return None
 
 
-class EnhancedProbabilisticStrategy(AIStrategy):
+class ProbabilisticStrategy(AIStrategy):
     def __init__(self):
         self.probability_cache = {}  # Cache probability calculations
         self.constraint_groups = []  # Track related constraint groups
@@ -844,53 +872,48 @@ class EnhancedProbabilisticStrategy(AIStrategy):
         return ("click", *random.choice(unknown_tiles))
 
 
-class EnhancedCSPStrategy(AIStrategy):
-    def __init__(self):
-        self.solution_cache = {}  # Cache solutions for similar patterns
-        self.constraint_history = []  # Track constraint evolution
-
+class CSPStrategy(AIStrategy):
     def next_move(self, game):
-        # Phase 1: Quick deterministic moves (highest priority)
+        # Phase 1: Try deterministic moves first (these are fast and reliable)
         deterministic_move = self.find_deterministic_moves(game)
         if deterministic_move:
             return deterministic_move
 
-        # Phase 2: Enhanced CSP solving with multiple techniques
-        csp_move = self.solve_enhanced_csp(game)
+        # Phase 2: Try CSP solving for more complex situations
+        csp_move = self.solve_csp(game)
         if csp_move:
             return csp_move
 
-        # Phase 3: Advanced probability with CSP insights
-        prob_move = self.csp_guided_probability(game)
-        if prob_move:
-            return prob_move
-
-        # Phase 4: Fallback to strategic random
-        return self.strategic_fallback(game)
+        # Phase 3: Probabilistic fallback
+        return self.probability_fallback(game)
 
     def find_deterministic_moves(self, game):
-        """Find 100% certain moves using advanced logical rules"""
-        constraints = self.build_enhanced_constraints(game)
+        """Find obvious safe/mine moves using basic minesweeper logic"""
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+                if tile["state"] == STATE_CLICKED and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    unknown_neighbors = [n for n in neighbors if n["state"] == STATE_DEFAULT]
+                    flagged_neighbors = [n for n in neighbors if n["state"] == STATE_FLAGGED]
 
-        # Apply multiple rounds of constraint propagation
-        definite_assignments = self.multi_round_propagation(constraints)
+                    # Safe click: all required mines are already flagged
+                    if len(flagged_neighbors) == tile["mines"] and unknown_neighbors:
+                        n = unknown_neighbors[0]
+                        return ('click', n["coords"]["x"], n["coords"]["y"])
 
-        if definite_assignments:
-            # Prioritize flagging mines over safe clicks for better AI flow
-            mines = [var for var, is_mine in definite_assignments.items() if is_mine]
-            safe = [var for var, is_mine in definite_assignments.items() if not is_mine]
-
-            if mines:
-                return "flag", mines[0][0], mines[0][1]
-            if safe:
-                return "click", safe[0][0], safe[0][1]
+                    # Sure flag: remaining unknown tiles must all be mines
+                    remaining_mines = tile["mines"] - len(flagged_neighbors)
+                    if remaining_mines > 0 and len(unknown_neighbors) == remaining_mines:
+                        n = unknown_neighbors[0]
+                        return ('flag', n["coords"]["x"], n["coords"]["y"])
 
         return None
 
-    def build_enhanced_constraints(self, game):
-        """Build comprehensive constraint system with optimization"""
+    def build_constraints(self, game):
+        """Build CSP constraints from the current board state"""
         constraints = []
-        constraint_map = {}  # Track which tiles appear in which constraints
+        variables = set()
 
         for x in range(game.size_x):
             for y in range(game.size_y):
@@ -902,552 +925,172 @@ class EnhancedCSPStrategy(AIStrategy):
 
                     for n in neighbors:
                         if n["state"] == STATE_DEFAULT:
-                            pos = (n["coords"]["x"], n["coords"]["y"])
-                            unknown_neighbors.append(pos)
-                            # Track constraint membership
-                            if pos not in constraint_map:
-                                constraint_map[pos] = []
-                            constraint_map[pos].append(len(constraints))
+                            coord = (n["coords"]["x"], n["coords"]["y"])
+                            unknown_neighbors.append(coord)
+                            variables.add(coord)
                         elif n["state"] == STATE_FLAGGED:
                             flagged_count += 1
 
+                    # Only add constraint if there are unknown neighbors
                     if unknown_neighbors:
-                        remaining_mines = tile["mines"] - flagged_count
-                        constraints.append({
-                            'vars': unknown_neighbors,
-                            'mines': remaining_mines,
-                            'source': (x, y),
-                            'satisfied': False
-                        })
+                        required_mines = tile["mines"] - flagged_count
+                        # Skip invalid constraints
+                        if 0 <= required_mines <= len(unknown_neighbors):
+                            constraints.append((unknown_neighbors, required_mines))
 
-        # Simplify constraints by removing redundancies
-        simplified_constraints = self.simplify_constraints(constraints)
-        return simplified_constraints, constraint_map
+        return list(variables), constraints
 
-    def simplify_constraints(self, constraints):
-        """Remove redundant and dominated constraints"""
-        simplified = []
+    def solve_csp(self, game):
+        """Solve using constraint satisfaction with improved backtracking"""
+        variables, constraints = self.build_constraints(game)
 
-        for i, c1 in enumerate(constraints):
-            is_redundant = False
-
-            # Check if this constraint is dominated by others
-            for j, c2 in enumerate(constraints):
-                if i != j and set(c1['vars']) <= set(c2['vars']):
-                    # c1 is subset of c2, check if it's redundant
-                    if len(c1['vars']) < len(c2['vars']):
-                        # Not redundant, might provide useful info
-                        continue
-                    elif c1['mines'] == c2['mines']:
-                        # Identical constraint, remove duplicate
-                        is_redundant = True
-                        break
-
-            if not is_redundant:
-                simplified.append(c1)
-
-        return simplified
-
-    def multi_round_propagation(self, constraint_data):
-        """Advanced constraint propagation with multiple techniques"""
-        constraints, constraint_map = constraint_data
-        assignment = {}
-
-        max_rounds = 10
-        for round_num in range(max_rounds):
-            old_assignment_size = len(assignment)
-
-            # Round 1: Basic constraint propagation
-            self.basic_propagation_round(constraints, assignment)
-
-            # Round 2: Cross-constraint analysis
-            self.cross_constraint_round(constraints, assignment)
-
-            # Round 3: Subset constraint reasoning
-            self.subset_constraint_round(constraints, assignment)
-
-            # Round 4: Advanced pattern detection
-            self.pattern_detection_round(constraints, assignment)
-
-            # If no progress, break
-            if len(assignment) == old_assignment_size:
-                break
-
-        return assignment
-
-    def basic_propagation_round(self, constraints, assignment):
-        """Basic constraint propagation - faster than original"""
-        changed = True
-        iterations = 0
-        max_iterations = 50  # Prevent infinite loops
-
-        while changed and iterations < max_iterations:
-            changed = False
-            iterations += 1
-
-            for constraint in constraints:
-                if constraint['satisfied']:
-                    continue
-
-                vars_list = constraint['vars']
-                target_mines = constraint['mines']
-
-                # Filter to unassigned variables
-                unassigned = [v for v in vars_list if v not in assignment]
-                assigned_mines = sum(1 for v in vars_list if assignment.get(v, False))
-
-                remaining_mines = target_mines - assigned_mines
-
-                # All remaining must be safe
-                if remaining_mines == 0 and unassigned:
-                    for var in unassigned:
-                        assignment[var] = False
-                        changed = True
-
-                # All remaining must be mines
-                elif remaining_mines == len(unassigned) and remaining_mines > 0:
-                    for var in unassigned:
-                        assignment[var] = True
-                        changed = True
-
-                # Check if constraint is satisfied
-                if len(unassigned) == 0:
-                    constraint['satisfied'] = True
-
-    def cross_constraint_round(self, constraints, assignment):
-        """Analyze interactions between overlapping constraints"""
-        for i in range(len(constraints)):
-            for j in range(i + 1, len(constraints)):
-                c1, c2 = constraints[i], constraints[j]
-
-                if c1['satisfied'] or c2['satisfied']:
-                    continue
-
-                vars1_set = set(c1['vars'])
-                vars2_set = set(c2['vars'])
-                overlap = vars1_set & vars2_set
-
-                if not overlap:
-                    continue
-
-                # Subset reasoning
-                if vars1_set <= vars2_set:
-                    # c1 is subset of c2
-                    remaining_vars = list(vars2_set - vars1_set)
-                    if remaining_vars:
-                        mines_in_remaining = c2['mines'] - c1['mines']
-
-                        if mines_in_remaining == 0:
-                            # All remaining variables are safe
-                            for var in remaining_vars:
-                                if var not in assignment:
-                                    assignment[var] = False
-                        elif mines_in_remaining == len(remaining_vars):
-                            # All remaining variables are mines
-                            for var in remaining_vars:
-                                if var not in assignment:
-                                    assignment[var] = True
-
-                elif vars2_set <= vars1_set:
-                    # c2 is subset of c1
-                    remaining_vars = list(vars1_set - vars2_set)
-                    if remaining_vars:
-                        mines_in_remaining = c1['mines'] - c2['mines']
-
-                        if mines_in_remaining == 0:
-                            for var in remaining_vars:
-                                if var not in assignment:
-                                    assignment[var] = False
-                        elif mines_in_remaining == len(remaining_vars):
-                            for var in remaining_vars:
-                                if var not in assignment:
-                                    assignment[var] = True
-
-    def subset_constraint_round(self, constraints, assignment):
-        """Advanced subset constraint reasoning"""
-        # Look for constraint combinations that create forced moves
-        for i in range(len(constraints)):
-            c1 = constraints[i]
-            if c1['satisfied']:
-                continue
-
-            unassigned1 = [v for v in c1['vars'] if v not in assignment]
-            if len(unassigned1) <= 1:
-                continue
-
-            # Find constraints that share exactly some variables with c1
-            for j in range(len(constraints)):
-                if i == j:
-                    continue
-
-                c2 = constraints[j]
-                if c2['satisfied']:
-                    continue
-
-                unassigned2 = [v for v in c2['vars'] if v not in assignment]
-
-                shared = set(unassigned1) & set(unassigned2)
-                if len(shared) == 0 or len(shared) == len(unassigned1) or len(shared) == len(unassigned2):
-                    continue
-
-                # Complex subset analysis
-                c1_only = set(unassigned1) - shared
-                c2_only = set(unassigned2) - shared
-
-                if len(c1_only) > 0 and len(c2_only) > 0:
-                    # Try to derive information about exclusive regions
-                    assigned_mines1 = sum(1 for v in c1['vars'] if assignment.get(v, False))
-                    assigned_mines2 = sum(1 for v in c2['vars'] if assignment.get(v, False))
-
-                    remaining_mines1 = c1['mines'] - assigned_mines1
-                    remaining_mines2 = c2['mines'] - assigned_mines2
-
-                    # If we can determine bounds on the shared region
-                    min_shared = max(0, remaining_mines1 - len(c1_only), remaining_mines2 - len(c2_only))
-                    max_shared = min(len(shared), remaining_mines1, remaining_mines2)
-
-                    if min_shared == max_shared:
-                        # Exact number of mines in shared region is determined
-                        mines_in_c1_only = remaining_mines1 - min_shared
-                        mines_in_c2_only = remaining_mines2 - min_shared
-
-                        # Apply this knowledge
-                        if mines_in_c1_only == 0:
-                            for var in c1_only:
-                                if var not in assignment:
-                                    assignment[var] = False
-                        elif mines_in_c1_only == len(c1_only):
-                            for var in c1_only:
-                                if var not in assignment:
-                                    assignment[var] = True
-
-                        if mines_in_c2_only == 0:
-                            for var in c2_only:
-                                if var not in assignment:
-                                    assignment[var] = False
-                        elif mines_in_c2_only == len(c2_only):
-                            for var in c2_only:
-                                if var not in assignment:
-                                    assignment[var] = True
-
-    def pattern_detection_round(self, constraints, assignment):
-        """Detect and solve common minesweeper patterns"""
-        # Look for 1-2-1 patterns and similar
-        for constraint in constraints:
-            if constraint['satisfied'] or constraint['mines'] != 2:
-                continue
-
-            vars_list = [v for v in constraint['vars'] if v not in assignment]
-            if len(vars_list) != 3:
-                continue
-
-            # Check if this forms a line (common 1-2-1 pattern signature)
-            positions = sorted(vars_list)
-
-            # Check for horizontal line
-            if (len(set(pos[0] for pos in positions)) == 1 and
-                    positions[1][1] == positions[0][1] + 1 and
-                    positions[2][1] == positions[1][1] + 1):
-
-                # This might be part of a 1-2-1 pattern
-                # Look for neighboring constraints that might complete the pattern
-                x = positions[0][0]
-                y_start = positions[0][1]
-
-                # Look for 1-constraints on either side
-                side_constraints = [c for c in constraints if c['mines'] == 1 and not c['satisfied']]
-
-                for side_c in side_constraints:
-                    side_vars = [v for v in side_c['vars'] if v not in assignment]
-                    if len(side_vars) == 2:
-                        # Check if this could complete a 1-2-1 pattern
-                        # This is a simplified version - could be expanded significantly
-                        pass
-
-    def solve_enhanced_csp(self, game):
-        """Enhanced CSP solving with intelligent search"""
-        constraints, constraint_map = self.build_enhanced_constraints(game)
-        variables = set()
-        for constraint in constraints:
-            variables.update(constraint['vars'])
-
-        if not constraints or not variables:
+        if not variables or not constraints:
             return None
 
-        # Try guided backtracking for smaller problems
-        if len(variables) <= 30:  # Increased from 25
-            solution = self.guided_backtrack_search(variables, constraints)
-            if solution:
-                mines = [var for var, is_mine in solution.items() if is_mine]
-                safe = [var for var, is_mine in solution.items() if not is_mine]
+        # Limit problem size to avoid timeouts
+        if len(variables) > 30:
+            # Focus on the most constrained area
+            variables = self.select_most_constrained_variables(variables, constraints, 25)
+            # Filter constraints to only include selected variables
+            constraints = [(vars_list, mines) for vars_list, mines in constraints
+                           if any(v in variables for v in vars_list)]
 
-                if mines:
-                    return ("flag", mines[0][0], mines[0][1])
-                if safe:
-                    return ("click", safe[0][0], safe[0][1])
+        # Try to find solutions using backtracking
+        solutions = []
+        self.backtrack_solutions(variables, constraints, {}, 0, solutions, max_solutions=50)
 
-        return None
+        if solutions:
+            # Analyze solutions to find certain moves
+            certain_safe, certain_mines = self.analyze_solutions(variables, solutions)
 
-    def guided_backtrack_search(self, variables, constraints):
-        """Intelligent backtracking with heuristics"""
-        variables_list = self.order_variables_intelligently(variables, constraints)
-        constraints_list = self.order_constraints_by_tightness(constraints)
-
-        assignment = {}
-
-        # Pre-process with constraint propagation
-        self.multi_round_propagation((constraints_list, {}))
-
-        if self.backtrack_with_heuristics(variables_list, constraints_list, assignment, 0):
-            return assignment
+            if certain_safe:
+                x, y = certain_safe[0]
+                return ('click', x, y)
+            elif certain_mines:
+                x, y = certain_mines[0]
+                return ('flag', x, y)
 
         return None
 
-    def order_variables_intelligently(self, variables, constraints):
-        """Order variables using Most Constraining Variable heuristic"""
+    def select_most_constrained_variables(self, variables, constraints, limit):
+        """Select the most constrained variables to focus CSP solving"""
         variable_scores = {}
 
         for var in variables:
-            score = 0
+            # Count how many constraints involve this variable
+            constraint_count = sum(1 for vars_list, _ in constraints if var in vars_list)
+            variable_scores[var] = constraint_count
 
-            # Count how many constraints this variable appears in
-            constraint_count = sum(1 for c in constraints if var in c['vars'])
-            score += constraint_count * 10
+        # Sort by constraint count (most constrained first)
+        sorted_vars = sorted(variable_scores.items(), key=lambda x: x[1], reverse=True)
+        return [var for var, _ in sorted_vars[:limit]]
 
-            # Prefer variables in tighter constraints
-            for constraint in constraints:
-                if var in constraint['vars']:
-                    tightness = constraint['mines'] / len(constraint['vars'])
-                    score += tightness * 5
+    def backtrack_solutions(self, variables, constraints, assignment, var_index, solutions, max_solutions=100):
+        """Find solutions using backtracking with pruning"""
+        if len(solutions) >= max_solutions:
+            return False
 
-            # Prefer variables with fewer unassigned neighbors (domain size)
-            unassigned_neighbors = len([c for c in constraints
-                                        if var in c['vars'] and not c.get('satisfied', False)])
-            score += unassigned_neighbors * 3
-
-            variable_scores[var] = score
-
-        # Sort by score descending (most constraining first)
-        return sorted(variables, key=lambda v: variable_scores.get(v, 0), reverse=True)
-
-    def order_constraints_by_tightness(self, constraints):
-        """Order constraints by tightness for better pruning"""
-
-        def constraint_tightness(c):
-            if len(c['vars']) == 0:
-                return 0
-            return abs(c['mines'] / len(c['vars']) - 0.5)  # Distance from 0.5 probability
-
-        return sorted(constraints, key=constraint_tightness, reverse=True)
-
-    def backtrack_with_heuristics(self, variables, constraints, assignment, var_index):
-        """Enhanced backtracking with intelligent pruning"""
         if var_index == len(variables):
-            return self.verify_solution(assignment, constraints)
+            if self.is_complete_solution_valid(assignment, constraints):
+                solutions.append(assignment.copy())
+            return True
 
         var = variables[var_index]
 
-        # Most Constraining Value heuristic: try False first (safe), then True (mine)
-        # This often leads to faster solutions in minesweeper
-        for value in [False, True]:
+        # Try both values: 0 (safe) and 1 (mine)
+        for value in [0, 1]:
             assignment[var] = value
 
-            # Early constraint checking for efficiency
-            if self.is_consistent_fast(assignment, constraints, var):
-                # Forward checking: see if this assignment makes future assignments impossible
-                if self.forward_check_viable(assignment, constraints, variables, var_index):
-                    if self.backtrack_with_heuristics(variables, constraints, assignment, var_index + 1):
-                        return True
+            if self.is_partial_assignment_valid(assignment, constraints):
+                if not self.backtrack_solutions(variables, constraints, assignment,
+                                                var_index + 1, solutions, max_solutions):
+                    break
 
             del assignment[var]
 
-        return False
+        return True
 
-    def is_consistent_fast(self, assignment, constraints, changed_var):
-        """Fast consistency check focusing on constraints involving changed variable"""
-        for constraint in constraints:
-            if changed_var not in constraint['vars']:
-                continue  # Skip constraints not involving the changed variable
+    def is_partial_assignment_valid(self, assignment, constraints):
+        """Check if partial assignment could lead to a valid solution"""
+        for vars_list, required_mines in constraints:
+            assigned_vars = [v for v in vars_list if v in assignment]
+            unassigned_vars = [v for v in vars_list if v not in assignment]
 
-            assigned_mines = sum(1 for v in constraint['vars']
-                                 if v in assignment and assignment[v])
-            unassigned = [v for v in constraint['vars'] if v not in assignment]
+            if assigned_vars:
+                current_mines = sum(assignment[v] for v in assigned_vars)
+                remaining_mines = required_mines - current_mines
 
-            # Early pruning conditions
-            if assigned_mines > constraint['mines']:
-                return False
-            if assigned_mines + len(unassigned) < constraint['mines']:
-                return False
+                # Check if it's possible to satisfy the constraint
+                if remaining_mines < 0 or remaining_mines > len(unassigned_vars):
+                    return False
 
         return True
 
-    def forward_check_viable(self, assignment, constraints, variables, current_index):
-        """Check if remaining variables can satisfy constraints"""
-        remaining_vars = set(variables[current_index + 1:])
-
-        for constraint in constraints:
-            constraint_vars = set(constraint['vars'])
-            remaining_in_constraint = constraint_vars & remaining_vars
-
-            if not remaining_in_constraint:
-                continue  # No remaining variables in this constraint
-
-            assigned_mines = sum(1 for v in constraint['vars']
-                                 if v in assignment and assignment[v])
-            remaining_mines = constraint['mines'] - assigned_mines
-
-            # Check if it's possible to satisfy this constraint
-            if remaining_mines < 0:
-                return False
-            if remaining_mines > len(remaining_in_constraint):
-                return False
-
-        return True
-
-    def verify_solution(self, assignment, constraints):
-        """Verify that the complete assignment satisfies all constraints"""
-        for constraint in constraints:
-            actual_mines = sum(1 for v in constraint['vars']
-                               if assignment.get(v, False))
-            if actual_mines != constraint['mines']:
+    def is_complete_solution_valid(self, assignment, constraints):
+        """Check if complete assignment satisfies all constraints"""
+        for vars_list, required_mines in constraints:
+            actual_mines = sum(assignment.get(v, 0) for v in vars_list)
+            if actual_mines != required_mines:
                 return False
         return True
 
-    def csp_guided_probability(self, game):
-        """Probability analysis enhanced with CSP insights"""
-        constraints, constraint_map = self.build_enhanced_constraints(game)
+    def analyze_solutions(self, variables, solutions):
+        """Analyze solutions to find variables that are always safe or always mines"""
+        certain_safe = []
+        certain_mines = []
 
-        if not constraints:
-            return self.basic_probability_fallback(game)
+        for var in variables:
+            values = [solution[var] for solution in solutions]
+            if all(v == 0 for v in values):  # Always safe
+                certain_safe.append(var)
+            elif all(v == 1 for v in values):  # Always mine
+                certain_mines.append(var)
 
-        prob_map = {}
-        confidence_map = {}  # Track confidence in probability estimates
+        return certain_safe, certain_mines
 
-        # Analyze each variable's probability across multiple constraint contexts
-        all_variables = set()
-        for constraint in constraints:
-            all_variables.update(constraint['vars'])
+    def probability_fallback(self, game):
+        """Improved probabilistic fallback with better global reasoning"""
+        unknown_cells = []
+        constrained_cells = set()
 
-        for var in all_variables:
-            var_probs = []
-            var_confidences = []
+        # Collect all unknown cells and identify which ones are constrained
+        variables, constraints = self.build_constraints(game)
+        constrained_cells.update(variables)
 
-            # Get probability from each constraint involving this variable
-            for constraint in constraints:
-                if var in constraint['vars'] and len(constraint['vars']) > 0:
-                    basic_prob = constraint['mines'] / len(constraint['vars'])
-                    var_probs.append(basic_prob)
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                if game.tiles[x][y]["state"] == STATE_DEFAULT:
+                    unknown_cells.append((x, y))
 
-                    # Confidence based on constraint tightness and size
-                    confidence = min(1.0, len(constraint['vars']) / 8.0)  # More variables = more confidence
-                    confidence *= abs(basic_prob - 0.5) * 2  # Extreme probabilities more confident
-                    var_confidences.append(confidence)
-
-            if var_probs:
-                # Weighted average based on confidence
-                if sum(var_confidences) > 0:
-                    weighted_prob = sum(p * c for p, c in zip(var_probs, var_confidences)) / sum(var_confidences)
-                else:
-                    weighted_prob = sum(var_probs) / len(var_probs)
-
-                prob_map[var] = weighted_prob
-                confidence_map[var] = sum(var_confidences) / len(var_confidences) if var_confidences else 0
-
-        # Find best move based on probability and confidence
-        if prob_map:
-            # Prefer high-confidence low-probability tiles
-            best_var = min(prob_map.items(),
-                           key=lambda x: x[1] - confidence_map.get(x[0], 0) * 0.1)[0]
-
-            if prob_map[best_var] < 0.1:  # Very likely safe
-                return ("click", best_var[0], best_var[1])
-            elif prob_map[best_var] > 0.9:  # Very likely mine
-                return ("flag", best_var[0], best_var[1])
-            else:
-                # Choose the safest option
-                safest = min(prob_map.items(), key=lambda x: x[1])[0]
-                return ("click", safest[0], safest[1])
-
-        return None
-
-    def basic_probability_fallback(self, game):
-        """Basic probability calculation when no constraints available"""
-        # Count remaining mines and tiles
-        total_tiles = game.size_x * game.size_y
-        revealed_tiles = sum(1 for x in range(game.size_x) for y in range(game.size_y)
-                             if game.tiles[x][y]["state"] != STATE_DEFAULT)
-        flagged_mines = sum(1 for x in range(game.size_x) for y in range(game.size_y)
-                            if game.tiles[x][y]["state"] == STATE_FLAGGED)
-
-        remaining_tiles = total_tiles - revealed_tiles
-        remaining_mines = game.total_mines - flagged_mines
-
-        if remaining_tiles > 0:
-            global_prob = remaining_mines / remaining_tiles
-
-            # Choose a random tile with global probability consideration
-            unknown_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
-                             if game.tiles[x][y]["state"] == STATE_DEFAULT]
-
-            if unknown_tiles:
-                # Prefer corner/edge tiles in early game (lower probability)
-                if len(unknown_tiles) > (total_tiles * 0.7):
-                    corners_edges = [(x, y) for x, y in unknown_tiles
-                                     if x == 0 or x == game.size_x - 1 or y == 0 or y == game.size_y - 1]
-                    if corners_edges:
-                        return ("click", *random.choice(corners_edges))
-
-                return ("click", *random.choice(unknown_tiles))
-
-        return None
-
-    def strategic_fallback(self, game):
-        """Intelligent fallback when CSP can't determine moves"""
-        unknown_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
-                         if game.tiles[x][y]["state"] == STATE_DEFAULT]
-
-        if not unknown_tiles:
+        if not unknown_cells:
             return None
 
-        # Score tiles based on multiple factors
-        tile_scores = {}
+        # Calculate global mine probability
+        total_mines = game.total_mines if hasattr(game, 'total_mines') else game.mine_count
+        flagged_count = sum(1 for x in range(game.size_x) for y in range(game.size_y)
+                            if game.tiles[x][y]["state"] == STATE_FLAGGED)
+        remaining_mines = total_mines - flagged_count
 
-        for x, y in unknown_tiles:
-            score = 0
-            neighbors = game.get_neighbors(x, y)
+        if remaining_mines <= 0:
+            # All mines found, click any unknown cell
+            x, y = unknown_cells[0]
+            return ('click', x, y)
 
-            # Factor 1: Prefer tiles with fewer numbered neighbors (less constrained)
-            numbered_neighbors = sum(1 for n in neighbors
-                                     if n["state"] == STATE_CLICKED and n["mines"] > 0)
-            score -= numbered_neighbors * 3
+        # Prefer unconstrained cells when possible (they're often safer)
+        unconstrained_cells = [(x, y) for x, y in unknown_cells if (x, y) not in constrained_cells]
 
-            # Factor 2: Avoid tiles near high numbers
-            high_numbers = sum(1 for n in neighbors
-                               if n["state"] == STATE_CLICKED and n["mines"] >= 4)
-            score -= high_numbers * 5
+        if unconstrained_cells and len(constrained_cells) > 0:
+            # Calculate probabilities
+            global_prob = remaining_mines / len(unknown_cells)
 
-            # Factor 3: Prefer tiles with more unknown neighbors (preservation of options)
-            unknown_neighbors = sum(1 for n in neighbors if n["state"] == STATE_DEFAULT)
-            score += unknown_neighbors * 2
+            # If unconstrained cells have lower probability than average, prefer them
+            if len(unconstrained_cells) > remaining_mines:
+                x, y = unconstrained_cells[0]
+                return ('click', x, y)
 
-            # Factor 4: Slight preference for edge/corner tiles in mid-game
-            total_revealed = sum(1 for x in range(game.size_x) for y in range(game.size_y)
-                                 if game.tiles[x][y]["state"] != STATE_DEFAULT)
-            total_tiles = game.size_x * game.size_y
-
-            if total_revealed < total_tiles * 0.6:  # Mid-game
-                if x == 0 or x == game.size_x - 1 or y == 0 or y == game.size_y - 1:
-                    score += 1
-
-            tile_scores[(x, y)] = score
-
-        # Choose from top 30% of tiles randomly
-        sorted_tiles = sorted(tile_scores.items(), key=lambda x: x[1], reverse=True)
-        top_portion = max(1, len(sorted_tiles) // 3)
-        best_tiles = [tile for tile, _ in sorted_tiles[:top_portion]]
-
-        chosen = random.choice(best_tiles)
-        return ("click", chosen[0], chosen[1])
+        # Otherwise, click the first available unknown cell
+        x, y = unknown_cells[0]
+        return ('click', x, y)
 
 
 class HybridStrategy(AIStrategy):
@@ -1857,1179 +1500,456 @@ class HybridStrategy(AIStrategy):
         return ("click", chosen_tile[0], chosen_tile[1])
 
 
-class AdvancedPatternStrategy(AIStrategy):
-    """
-    Advanced Pattern Recognition Strategy for Minesweeper
-    Recognizes complex patterns including:
-    - 1-1-2-X corner patterns
-    - 1-2-2-1 wall patterns
-    - 3-2-1 sequences
-    - L-shaped patterns
-    - T-junction patterns
-    - And many more advanced configurations
-    """
+class CNNTrainer:
+    """Trains a CNN Minesweeper solver from minefields.json data."""
 
-    def __init__(self):
-        self.pattern_cache = {}  # Cache successful pattern matches
-        self.debug_mode = False  # Set to True for debugging output
+    def __init__(self, minefields_file: str = "minefields.json"):
+        self.minefields_file = minefields_file
+        self.model = None
+        
+        # Create model directory if it doesn't exist
+        os.makedirs("model", exist_ok=True)
+
+    # ---------------------------
+    # Data generation
+    # ---------------------------
+
+    def generate_training_data(self, difficulty="Beginner", max_games=300000):
+        """Generate training examples by simulating perfect games."""
+        print(f"Generating training data from {self.minefields_file}...")
+
+        try:
+            with open(self.minefields_file, 'r') as f:
+                all_minefields = json.load(f)
+        except FileNotFoundError:
+            print(f"Error: {self.minefields_file} not found. Run benchmark first.")
+            return []
+        except json.JSONDecodeError:
+            print(f"Error: Invalid JSON in {self.minefields_file}")
+            return []
+
+        if difficulty not in all_minefields:
+            print(f"No data for {difficulty} difficulty")
+            return []
+
+        minefields = all_minefields[difficulty][:max_games]
+        training_examples = []
+
+        for i, minefield in enumerate(minefields):
+            if i % 10000 == 0:
+                print(f"Processing minefield {i + 1}/{len(minefields)}")
+
+            try:
+                examples = self._simulate_perfect_game(minefield)
+                training_examples.extend(examples)
+            except Exception as e:
+                print(f"Error processing minefield {i}: {e}")
+
+        print(f"Generated {len(training_examples)} training examples")
+        return training_examples
+
+    def _simulate_perfect_game(self, minefield):
+        """Play out a game with an expert solver to collect training states."""
+        try:
+            game = HeadlessMinesweeper(minefield)
+            solver = CSPStrategy()
+            examples = []
+
+            # Start with center click
+            cx, cy = game.size_x // 2, game.size_y // 2
+            if not game.process_move("click", cx, cy):  # unlucky first click
+                return []
+
+            step, max_steps = 0, game.size_x * game.size_y * 2
+            while not game.game_over_flag and step < max_steps:
+                state_matrix = self._encode_game_state(game)
+                move = solver.next_move(game)
+                if not move:
+                    break
+
+                move_type, x, y = move
+                target = self._create_target_labels(game)
+
+                examples.append({
+                    "state": state_matrix.copy(),
+                    "target": target,
+                    "action": (move_type, x, y)
+                })
+
+                # Apply move
+                if move_type == "click":
+                    if not game.process_move("click", x, y):
+                        break  # mine hit
+                else:
+                    game.process_move("flag", x, y)
+
+                step += 1
+
+            return examples
+        except Exception as e:
+            print(f"Error simulating game: {e}")
+            return []
+
+    def _encode_game_state(self, game):
+        """Encode Minesweeper game state as multi-channel tensor for CNN."""
+        channels = 4
+        state = np.zeros((game.size_x, game.size_y, channels), dtype=np.float32)
+
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+
+                # Channel 0: Unknown cells
+                if tile["state"] == 0:  # default
+                    state[x, y, 0] = 1.0
+
+                # Channel 1: Revealed numbers (normalized 0–1)
+                elif tile["state"] == 1:  # clicked
+                    state[x, y, 1] = tile["mines"] / 8.0
+
+                # Channel 2: Flags
+                elif tile["state"] == 2:
+                    state[x, y, 2] = 1.0
+
+                # Channel 3: constraint ratio
+                if tile["state"] == 1 and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    flagged = sum(1 for n in neighbors if n["state"] == 2)
+                    unknown = sum(1 for n in neighbors if n["state"] == 0)
+                    remaining = tile["mines"] - flagged
+                    if unknown > 0:
+                        state[x, y, 3] = remaining / unknown
+
+        return state
+
+   
+    def _create_target_labels(self, game):
+        """Dense target labels: full minefield mask (1=mine, 0=safe)."""
+        target = np.zeros((game.size_x, game.size_y), dtype=np.float32)
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                # Fixed: use mine_positions instead of mines
+                target[x, y] = 1.0 if (x, y) in game.mine_positions else 0.0
+        return target
+    # ---------------------------
+    # Model
+    # ---------------------------
+
+    def build_model(self, input_shape):
+        """Construct the CNN architecture."""
+        model = keras.Sequential([
+            layers.Input(shape=input_shape),
+
+            layers.Conv2D(32, (3, 3), activation="relu", padding="same"),
+            layers.BatchNormalization(),
+            layers.Conv2D(32, (3, 3), activation="relu", padding="same"),
+            layers.BatchNormalization(),
+
+            layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
+            layers.BatchNormalization(),
+            layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
+            layers.BatchNormalization(),
+
+            layers.Conv2D(1, (1, 1), activation="sigmoid", padding="same"),
+            layers.Reshape(input_shape[:2])
+        ])
+
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss="binary_crossentropy",
+            metrics=[
+                keras.metrics.BinaryAccuracy(name="accuracy"),
+                keras.metrics.Precision(name="precision"),
+                keras.metrics.Recall(name="recall")
+            ]
+        )
+        return model
+
+    # ---------------------------
+    # Training
+    # ---------------------------
+
+    def train(self, difficulty="Beginner", max_games=10000, epochs=25):
+        """Train the CNN with lazy TensorFlow loading and save to model folder"""
+        # Load TensorFlow only when training is actually needed
+        if not load_tensorflow():
+            print("TensorFlow required for training.")
+            return None
+
+        training_examples = self.generate_training_data(difficulty, max_games)
+        if not training_examples:
+            print("No training data generated.")
+            return None
+
+        X, y = [], []
+        for example in training_examples:
+            X.append(example["state"])
+            y.append(example["target"])
+        
+        import numpy as np
+        X, y = np.array(X), np.array(y)
+
+        print(f"Training data shape: X={X.shape}, y={y.shape}")
+
+        input_shape = X.shape[1:]
+        self.model = self.build_model(input_shape)
+
+        print("Model architecture:")
+        self.model.summary()
+
+        history = self.model.fit(
+            X, y,
+            batch_size=(64 if difficulty == "Beginner" else (32 if difficulty == "Intermediate" else 16)),
+            epochs=epochs,
+            validation_split=0.2,
+            verbose=1,
+            callbacks=[
+                keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+                keras.callbacks.ReduceLROnPlateau(patience=3, factor=0.5)
+            ]
+        )
+
+        # Save model to model folder with organized naming
+        model_filename = f"minesweeper_cnn_{difficulty.lower()}_{max_games}.keras"
+        model_path = os.path.join("model", model_filename)
+        
+        self.model.save(model_path)
+        print(f"Model saved to {model_path}")
+        
+        # Also save a simplified name for easy loading
+        simple_filename = f"minesweeper_cnn_{difficulty.lower()}.keras"
+        simple_path = os.path.join("model", simple_filename)
+        self.model.save(simple_path)
+        print(f"Model also saved to {simple_path}")
+        
+        return self.model
+
+
+class TrainedCNNStrategy(AIStrategy):
+    """CNN strategy using pre-trained model with lazy loading"""
+
+    def __init__(self, model_path=None, difficulty="Intermediate"):
+        self.fallback_strategy = AutoOpenStrategy()  # Fallback strategy
+        self.model = None
+        self.difficulty = difficulty
+        self.model_path = model_path
+        self.tf_loaded = False
+        
+        # Create model directory if it doesn't exist
+        os.makedirs("model", exist_ok=True)
+        
+        # Don't load model immediately - wait until first use
+
+    def load_model(self, model_path):
+        """Load trained model with lazy TensorFlow loading"""
+        if not self.tf_loaded:
+            if not load_tensorflow():
+                print("TensorFlow not available, using fallback strategy")
+                return False
+            self.tf_loaded = True
+
+        try:
+            self.model = keras.models.load_model(model_path)
+            return True
+        except Exception as e:
+            print(f"Failed to load model {model_path}: {e}")
+            self.model = None
+            return False
 
     def next_move(self, game):
-        """Main pattern recognition logic with prioritized pattern matching"""
+        """Get next move using CNN or fallback"""
+        # Always try deterministic moves first (fast)
+        move = self._deterministic_moves(game)
+        if move:
+            return move
 
-        # Phase 1: Basic deterministic moves (highest priority)
-        basic_move = self._find_basic_moves(game)
-        if basic_move:
-            return basic_move
+        # Load model on first use if not already loaded
+        if self.model is None and not self.tf_loaded:
+            # Define model paths to try (in order of preference)
+            model_paths = []
+            
+            # If specific path provided, try it first
+            if self.model_path:
+                model_paths.append(self.model_path)
+            
+            # Try standard paths in model folder
+            model_paths.extend([
+                f"model/minesweeper_cnn_{self.difficulty.lower()}.keras",
 
-        # Phase 2: Advanced corner patterns (high success rate)
-        corner_move = self._find_corner_patterns(game)
-        if corner_move:
-            return corner_move
+            ])
+            
+            # Try root directory as fallback
+            model_paths.extend([
+                f"minesweeper_cnn_{self.difficulty.lower()}.keras",
 
-        # Phase 3: Wall and edge patterns
-        wall_move = self._find_wall_patterns(game)
-        if wall_move:
-            return wall_move
+            ])
+            
+            model_loaded = False
+            for path in model_paths:
+                if os.path.exists(path):
+                    print(f"Found model at: {path}")
+                    if self.load_model(path):
+                        model_loaded = True
+                        break
+            
+            if not model_loaded:
+                print(f"No trained model found for {self.difficulty}.")
+                print(f"Searched in: {model_paths[:3]}")
+                print("Using fallback strategy.")
 
-        # Phase 4: Sequential number patterns
-        sequence_move = self._find_sequence_patterns(game)
-        if sequence_move:
-            return sequence_move
+        # Use CNN if available
+        if self.model is not None:
+            try:
+                move = self._cnn_prediction(game)
+                if move:
+                    return move
+            except Exception as e:
+                print(f"CNN prediction error: {e}")
 
-        # Phase 5: L-shaped and T-junction patterns
-        junction_move = self._find_junction_patterns(game)
-        if junction_move:
-            return junction_move
+        # Fall back to pattern-based strategy
+        return self.fallback_strategy.next_move(game)
 
-        # Phase 6: Complex geometric patterns
-        geometric_move = self._find_geometric_patterns(game)
-        if geometric_move:
-            return geometric_move
-
-        # Phase 7: Probabilistic pattern matching
-        prob_move = self._find_probabilistic_patterns(game)
-        if prob_move:
-            return prob_move
-
-        # Fallback to smart random
-        return self._smart_random_fallback(game)
-
-    def _find_basic_moves(self, game):
-        """Find basic deterministic moves (same as before but optimized)"""
+    def _deterministic_moves(self, game):
+        """Find certain moves (no TensorFlow needed)"""
         for x in range(game.size_x):
             for y in range(game.size_y):
                 tile = game.tiles[x][y]
-                if tile["state"] == STATE_CLICKED and tile["mines"] > 0:
-                    neighbors = game.get_neighbors(x, y)
-                    flagged_count = sum(1 for n in neighbors if n["state"] == STATE_FLAGGED)
-                    unflagged = [n for n in neighbors if n["state"] == STATE_DEFAULT]
-
-                    # Auto-open: all mines already flagged
-                    if flagged_count == tile["mines"] and unflagged:
-                        return ("click", unflagged[0]["coords"]["x"], unflagged[0]["coords"]["y"])
-
-                    # Auto-flag: remaining tiles must all be mines
-                    remaining_mines = tile["mines"] - flagged_count
-                    if remaining_mines > 0 and len(unflagged) == remaining_mines:
-                        return ("flag", unflagged[0]["coords"]["x"], unflagged[0]["coords"]["y"])
-        return None
-
-    def _find_corner_patterns(self, game):
-        """Advanced corner pattern recognition including 1-1-2-X patterns"""
-
-        # Check all corner positions and near-corner areas
-        corner_regions = [
-            # True corners
-            [(0, 0, 3, 3)],  # Top-left
-            [(0, game.size_y - 3, 3, 3)],  # Top-right
-            [(game.size_x - 3, 0, 3, 3)],  # Bottom-left
-            [(game.size_x - 3, game.size_y - 3, 3, 3)]  # Bottom-right
-        ]
-
-        for region in corner_regions:
-            move = self._analyze_corner_region(game, region[0])
-            if move:
-                return move
-
-        # Check edge corners (not true corners but near edges)
-        for x in range(min(2, game.size_x)):
-            for y in range(min(2, game.size_y)):
-                move = self._check_112x_pattern(game, x, y)
-                if move:
-                    return move
-
-        return None
-
-    def _check_112x_pattern(self, game, start_x, start_y):
-        """Check for 1-1-2-X corner patterns in various orientations"""
-
-        # Pattern configurations to check
-        patterns = [
-            # Horizontal then vertical
-            [(0, 0, 1), (0, 1, 1), (0, 2, 2), (1, 0), (1, 1), (1, 2)],  # L-shape right
-            [(0, 0, 1), (1, 0, 1), (2, 0, 2), (0, 1), (1, 1), (2, 1)],  # L-shape down
-
-            # Diagonal patterns
-            [(0, 0, 1), (1, 1, 1), (2, 2, 2), (0, 1), (1, 0), (1, 2), (2, 1)],  # Diagonal
-
-            # More complex corner arrangements
-            [(0, 0, 1), (0, 1, 2), (1, 0, 1), (1, 1), (0, 2), (1, 2)],  # Compact L
-        ]
-
-        for pattern in patterns:
-            move = self._match_corner_pattern(game, start_x, start_y, pattern)
-            if move:
-                return move
-
-        return None
-
-    def _match_corner_pattern(self, game, base_x, base_y, pattern):
-        try:
-            known_positions = []
-            unknown_positions = []
-            for item in pattern:
-                if len(item) == 3:
-                    dx, dy, expected_mines = item
-                    known_positions.append((base_x + dx, base_y + dy, expected_mines))
-                elif len(item) == 2:
-                    dx, dy = item
-                    unknown_positions.append((base_x + dx, base_y + dy))
-                else:
-                    # unexpected pattern element — skip or log
+                if tile["state"] != 1 or tile["mines"] == 0:
                     continue
 
-            # bounds check
-            all_positions = [(x, y) for x, y, _ in known_positions] + unknown_positions
-            for x, y in all_positions:
-                if not (0 <= x < game.size_x and 0 <= y < game.size_y):
-                    return None
+                neighbors = game.get_neighbors(x, y)
+                flagged = sum(1 for n in neighbors if n["state"] == 2)
+                unknown = [n for n in neighbors if n["state"] == 0]
+                remaining = tile["mines"] - flagged
 
-            # verify known positions are revealed and match expected mine counts
-            for x, y, expected_mines in known_positions:
-                tile = game.tiles[x][y]
-                if tile["state"] != STATE_CLICKED or tile["mines"] != expected_mines:
-                    return None
-
-            # unknowns must be default
-            for x, y in unknown_positions:
-                if game.tiles[x][y]["state"] != STATE_DEFAULT:
-                    return None
-
-            if len(known_positions) >= 3:
-                return self._deduce_corner_move(game, known_positions, unknown_positions)
-        except (IndexError, KeyError):
-            pass
-
+                if remaining == 0 and unknown:
+                    n = unknown[0]
+                    return ("click", n["coords"]["x"], n["coords"]["y"])
+                elif remaining == len(unknown) and remaining > 0:
+                    n = unknown[0]
+                    return ("flag", n["coords"]["x"], n["coords"]["y"])
         return None
 
-    def _deduce_corner_move(self, game, known_positions, unknown_positions):
-        """Deduce moves from corner pattern analysis"""
+    def _cnn_prediction(self, game):
+        """Use CNN to predict mine probabilities"""
+        if self.model is None:
+            return None
+            
+        state = self._encode_state(game)
+        state_batch = tf.expand_dims(state, axis=0)
 
-        # For 1-1-2 patterns, common deductions:
-        # - If two 1's share a corner with a 2, the corner is usually a mine
-        # - If a 2 is between two 1's, middle positions are often safe
+        predictions = self.model.predict(state_batch, verbose=0)[0]
 
-        if len(known_positions) == 3 and len(unknown_positions) >= 2:
-            mines_counts = [mines for _, _, mines in known_positions]
+        # Find best action
+        unknown_cells = [(x, y) for x in range(game.size_x)
+                         for y in range(game.size_y)
+                         if game.tiles[x][y]["state"] == 0]
 
-            # Classic 1-1-2 corner pattern
-            if sorted(mines_counts) == [1, 1, 2]:
-                # Find the position that's adjacent to both 1's and the 2
-                shared_positions = []
-
-                for ux, uy in unknown_positions:
-                    adjacent_to_all = True
-                    adjacent_count = 0
-
-                    for kx, ky, mines in known_positions:
-                        if abs(ux - kx) <= 1 and abs(uy - ky) <= 1 and (ux != kx or uy != ky):
-                            adjacent_count += 1
-
-                    if adjacent_count >= 2:  # Adjacent to multiple known tiles
-                        shared_positions.append((ux, uy))
-
-                # In 1-1-2 patterns, shared positions are often mines
-                if shared_positions:
-                    return ("flag", shared_positions[0][0], shared_positions[0][1])
-
-        return None
-
-    def _analyze_corner_region(self, game, region):
-        """Analyze a corner region for complex patterns"""
-        start_x, start_y, width, height = region
-
-        # Extract all tiles in the region
-        region_tiles = []
-        for x in range(start_x, min(start_x + width, game.size_x)):
-            for y in range(start_y, min(start_y + height, game.size_y)):
-                region_tiles.append((x, y, game.tiles[x][y]))
-
-        # Look for specific corner arrangements
-        numbered_tiles = [(x, y, tile) for x, y, tile in region_tiles
-                          if tile["state"] == STATE_CLICKED and tile["mines"] > 0]
-        unknown_tiles = [(x, y, tile) for x, y, tile in region_tiles
-                         if tile["state"] == STATE_DEFAULT]
-
-        if len(numbered_tiles) >= 2 and len(unknown_tiles) >= 1:
-            return self._analyze_numbered_cluster(game, numbered_tiles, unknown_tiles)
-
-        return None
-
-    def _find_wall_patterns(self, game):
-        """Find 1-2-2-1 wall patterns and similar edge configurations"""
-
-        # Check horizontal walls (top and bottom edges)
-        for edge_x in [0, game.size_x - 1]:
-            for y in range(game.size_y - 3):
-                move = self._check_wall_pattern_horizontal(game, edge_x, y)
-                if move:
-                    return move
-
-        # Check vertical walls (left and right edges)
-        for edge_y in [0, game.size_y - 1]:
-            for x in range(game.size_x - 3):
-                move = self._check_wall_pattern_vertical(game, x, edge_y)
-                if move:
-                    return move
-
-        # Check internal wall patterns (one row/column from edge)
-        for x in [1, game.size_x - 2]:
-            for y in range(game.size_y - 3):
-                move = self._check_wall_pattern_horizontal(game, x, y)
-                if move:
-                    return move
-
-        for y in [1, game.size_y - 2]:
-            for x in range(game.size_x - 3):
-                move = self._check_wall_pattern_vertical(game, x, y)
-                if move:
-                    return move
-
-        return None
-
-    def _check_wall_pattern_horizontal(self, game, x, start_y):
-        """Check for horizontal wall patterns like 1-2-2-1"""
-
-        # Try different pattern lengths
-        for length in [4, 3]:  # 1-2-2-1 or 1-2-1
-            if start_y + length > game.size_y:
-                continue
-
-            tiles = [game.tiles[x][start_y + i] for i in range(length)]
-
-            # Check if this matches known wall patterns
-            move = self._match_wall_pattern(game, x, start_y, tiles, "horizontal")
-            if move:
-                return move
-
-        return None
-
-    def _check_wall_pattern_vertical(self, game, start_x, y):
-        """Check for vertical wall patterns like 1-2-2-1"""
-
-        for length in [4, 3]:  # 1-2-2-1 or 1-2-1
-            if start_x + length > game.size_x:
-                continue
-
-            tiles = [game.tiles[start_x + i][y] for i in range(length)]
-
-            move = self._match_wall_pattern(game, start_x, y, tiles, "vertical")
-            if move:
-                return move
-
-        return None
-
-    def _match_wall_pattern(self, game, base_x, base_y, tiles, orientation):
-        """Match specific wall patterns and deduce moves"""
-
-        # Extract mine counts for revealed tiles
-        mine_counts = []
-        all_revealed = True
-
-        for tile in tiles:
-            if tile["state"] == STATE_CLICKED:
-                mine_counts.append(tile["mines"])
-            else:
-                all_revealed = False
-
-        if not all_revealed or len(mine_counts) < 3:
+        if not unknown_cells:
             return None
 
-        # Check for 1-2-2-1 pattern
-        if len(mine_counts) == 4 and mine_counts == [1, 2, 2, 1]:
-            return self._solve_1221_wall_pattern(game, base_x, base_y, orientation)
+        # Find safest cell
+        safest_prob = float('inf')
+        safest_cell = None
 
-        # Check for 1-2-1 pattern
-        if len(mine_counts) == 3 and mine_counts == [1, 2, 1]:
-            return self._solve_121_wall_pattern(game, base_x, base_y, orientation)
+        for x, y in unknown_cells:
+            mine_prob = predictions[x, y]
+            if mine_prob < safest_prob:
+                safest_prob = mine_prob
+                safest_cell = (x, y)
 
-        # Check for 2-3-2 pattern (higher numbers)
-        if len(mine_counts) == 3 and mine_counts == [2, 3, 2]:
-            return self._solve_232_wall_pattern(game, base_x, base_y, orientation)
-
-        return None
-
-    def _solve_1221_wall_pattern(self, game, base_x, base_y, orientation):
-        """Solve 1-2-2-1 wall patterns"""
-
-        # In 1-2-2-1 patterns along walls, typical solutions:
-        # - Positions opposite to 1's are mines
-        # - Positions opposite to 2's are safe
-
-        perpendicular_positions = []
-
-        if orientation == "horizontal":
-            # Check row above and below
-            for offset in [-1, 1]:
-                new_x = base_x + offset
-                if 0 <= new_x < game.size_x:
-                    row_positions = [(new_x, base_y + i) for i in range(4)]
-                    if all(0 <= y < game.size_y for _, y in row_positions):
-                        perpendicular_positions.extend(row_positions)
-        else:  # vertical
-            # Check columns left and right
-            for offset in [-1, 1]:
-                new_y = base_y + offset
-                if 0 <= new_y < game.size_y:
-                    col_positions = [(base_x + i, new_y) for i in range(4)]
-                    if all(0 <= x < game.size_x for x, _ in col_positions):
-                        perpendicular_positions.extend(col_positions)
-
-        # Apply 1-2-2-1 logic: flag positions opposite to 1's
-        for i, (x, y) in enumerate(perpendicular_positions[:4]):
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                # Position 0 and 3 correspond to 1's, so they're mines
-                if i % 4 in [0, 3]:
-                    return ("flag", x, y)
-                # Position 1 and 2 correspond to 2's, so they're safe
-                elif i % 4 in [1, 2]:
-                    return ("click", x, y)
-
-        return None
-
-    def _solve_121_wall_pattern(self, game, base_x, base_y, orientation):
-        """Solve 1-2-1 wall patterns"""
-
-        perpendicular_positions = []
-
-        if orientation == "horizontal":
-            for offset in [-1, 1]:
-                new_x = base_x + offset
-                if 0 <= new_x < game.size_x:
-                    row_positions = [(new_x, base_y + i) for i in range(3)]
-                    if all(0 <= y < game.size_y for _, y in row_positions):
-                        perpendicular_positions.extend(row_positions)
-        else:
-            for offset in [-1, 1]:
-                new_y = base_y + offset
-                if 0 <= new_y < game.size_y:
-                    col_positions = [(base_x + i, new_y) for i in range(3)]
-                    if all(0 <= x < game.size_x for x, _ in col_positions):
-                        perpendicular_positions.extend(col_positions)
-
-        # Apply 1-2-1 logic: positions 0 and 2 are mines, position 1 is safe
-        for i, (x, y) in enumerate(perpendicular_positions[:3]):
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                if i % 3 in [0, 2]:  # Positions opposite to 1's
-                    return ("flag", x, y)
-                elif i % 3 == 1:  # Position opposite to 2
-                    return ("click", x, y)
-
-        return None
-
-    def _solve_232_wall_pattern(self, game, base_x, base_y, orientation):
-        """Solve 2-3-2 wall patterns"""
-
-        # 2-3-2 patterns typically indicate dense mine fields
-        # Middle position (opposite to 3) often has mines on both sides
-        # Side positions need careful analysis
-
-        perpendicular_positions = []
-
-        if orientation == "horizontal":
-            for offset in [-1, 1]:
-                new_x = base_x + offset
-                if 0 <= new_x < game.size_x:
-                    row_positions = [(new_x, base_y + i) for i in range(3)]
-                    if all(0 <= y < game.size_y for _, y in row_positions):
-                        perpendicular_positions.extend(row_positions)
-        else:
-            for offset in [-1, 1]:
-                new_y = base_y + offset
-                if 0 <= new_y < game.size_y:
-                    col_positions = [(base_x + i, new_y) for i in range(3)]
-                    if all(0 <= x < game.size_x for x, _ in col_positions):
-                        perpendicular_positions.extend(col_positions)
-
-        # For 2-3-2, typically all positions opposite are mines
-        for x, y in perpendicular_positions[:3]:
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
+        if safest_cell:
+            x, y = safest_cell
+            # Flag if very confident it's a mine, click if confident it's safe
+            if safest_prob > 0.8:
                 return ("flag", x, y)
+            elif safest_prob < 0.3:
+                return ("click", x, y)
 
         return None
 
-    def _find_sequence_patterns(self, game):
-        """Find sequential number patterns like 3-2-1"""
+    def _encode_state(self, game):
+        """Encode game state for CNN"""
+        import numpy as np
+        
+        channels = 4
+        state = np.zeros((game.size_x, game.size_y, channels), dtype=np.float32)
 
-        # Check horizontal sequences
         for x in range(game.size_x):
-            for y in range(game.size_y - 2):
-                move = self._check_sequence_horizontal(game, x, y)
-                if move:
-                    return move
-
-        # Check vertical sequences
-        for x in range(game.size_x - 2):
             for y in range(game.size_y):
-                move = self._check_sequence_vertical(game, x, y)
-                if move:
-                    return move
-
-        # Check diagonal sequences
-        for x in range(game.size_x - 2):
-            for y in range(game.size_y - 2):
-                move = self._check_sequence_diagonal(game, x, y)
-                if move:
-                    return move
-
-        return None
-
-    def _check_sequence_horizontal(self, game, x, y):
-        """Check for horizontal sequential patterns"""
-
-        # Get three consecutive tiles
-        tiles = [game.tiles[x][y + i] for i in range(3)]
-
-        # Check if all are revealed
-        if not all(tile["state"] == STATE_CLICKED for tile in tiles):
-            return None
-
-        mine_counts = [tile["mines"] for tile in tiles]
-
-        # Check for various sequence patterns
-        return self._analyze_sequence_pattern(game, x, y, mine_counts, "horizontal")
-
-    def _check_sequence_vertical(self, game, x, y):
-        """Check for vertical sequential patterns"""
-
-        tiles = [game.tiles[x + i][y] for i in range(3)]
-
-        if not all(tile["state"] == STATE_CLICKED for tile in tiles):
-            return None
-
-        mine_counts = [tile["mines"] for tile in tiles]
-
-        return self._analyze_sequence_pattern(game, x, y, mine_counts, "vertical")
-
-    def _check_sequence_diagonal(self, game, x, y):
-        """Check for diagonal sequential patterns"""
-
-        # Check both diagonal directions
-        diag1_tiles = [game.tiles[x + i][y + i] for i in range(3)]
-        diag2_tiles = [game.tiles[x + i][y + 2 - i] for i in range(3)]
-
-        for tiles, direction in [(diag1_tiles, "diag1"), (diag2_tiles, "diag2")]:
-            if all(tile["state"] == STATE_CLICKED for tile in tiles):
-                mine_counts = [tile["mines"] for tile in tiles]
-                move = self._analyze_sequence_pattern(game, x, y, mine_counts, direction)
-                if move:
-                    return move
-
-        return None
-
-    def _analyze_sequence_pattern(self, game, base_x, base_y, mine_counts, direction):
-        """Analyze sequential patterns and deduce moves"""
-
-        # 3-2-1 descending sequence
-        if mine_counts == [3, 2, 1]:
-            return self._solve_321_sequence(game, base_x, base_y, direction)
-
-        # 1-2-3 ascending sequence
-        if mine_counts == [1, 2, 3]:
-            return self._solve_123_sequence(game, base_x, base_y, direction)
-
-        # 2-1-2 pattern
-        if mine_counts == [2, 1, 2]:
-            return self._solve_212_sequence(game, base_x, base_y, direction)
-
-        # 3-1-3 pattern
-        if mine_counts == [3, 1, 3]:
-            return self._solve_313_sequence(game, base_x, base_y, direction)
-
-        return None
-
-    def _solve_321_sequence(self, game, base_x, base_y, direction):
-        """Solve 3-2-1 sequence patterns"""
-
-        # In 3-2-1 sequences, mines typically concentrate near the 3
-        # and become sparser near the 1
-
-        perpendicular_positions = self._get_perpendicular_positions(game, base_x, base_y, 3, direction)
-
-        # Flag positions near the 3 (first position)
-        for i, (x, y) in enumerate(perpendicular_positions[:3]):
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                if i == 0:  # Position opposite to 3
-                    # High probability of mines near 3
-                    return ("flag", x, y)
-                elif i == 2:  # Position opposite to 1
-                    # Lower probability near 1, often safe
-                    return ("click", x, y)
-
-        return None
-
-    def _solve_123_sequence(self, game, base_x, base_y, direction):
-        """Solve 1-2-3 sequence patterns"""
-
-        perpendicular_positions = self._get_perpendicular_positions(game, base_x, base_y, 3, direction)
-
-        # In 1-2-3 sequences, mines concentrate near the 3
-        for i, (x, y) in enumerate(perpendicular_positions[:3]):
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                if i == 2:  # Position opposite to 3
-                    return ("flag", x, y)
-                elif i == 0:  # Position opposite to 1
-                    return ("click", x, y)
-
-        return None
-
-    def _solve_212_sequence(self, game, base_x, base_y, direction):
-        """Solve 2-1-2 sequence patterns"""
-
-        perpendicular_positions = self._get_perpendicular_positions(game, base_x, base_y, 3, direction)
-
-        # In 2-1-2 patterns, the middle (opposite to 1) is often safe
-        # The sides (opposite to 2's) often have mines
-        for i, (x, y) in enumerate(perpendicular_positions[:3]):
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                if i == 1:  # Position opposite to 1 (middle)
-                    return ("click", x, y)
-                elif i in [0, 2]:  # Positions opposite to 2's
-                    return ("flag", x, y)
-
-        return None
-
-    def _solve_313_sequence(self, game, base_x, base_y, direction):
-        """Solve 3-1-3 sequence patterns"""
-
-        perpendicular_positions = self._get_perpendicular_positions(game, base_x, base_y, 3, direction)
-
-        # 3-1-3 patterns usually have mines on the sides and safe in middle
-        for i, (x, y) in enumerate(perpendicular_positions[:3]):
-            if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                if i in [0, 2]:  # Positions opposite to 3's
-                    return ("flag", x, y)
-                elif i == 1:  # Position opposite to 1
-                    return ("click", x, y)
-
-        return None
-
-    def _get_perpendicular_positions(self, game, base_x, base_y, length, direction):
-        """Get positions perpendicular to a sequence"""
-
-        positions = []
-
-        if direction == "horizontal":
-            for offset in [-1, 1]:
-                new_x = base_x + offset
-                if 0 <= new_x < game.size_x:
-                    for i in range(length):
-                        pos = (new_x, base_y + i)
-                        if 0 <= pos[1] < game.size_y:
-                            positions.append(pos)
-
-        elif direction == "vertical":
-            for offset in [-1, 1]:
-                new_y = base_y + offset
-                if 0 <= new_y < game.size_y:
-                    for i in range(length):
-                        pos = (base_x + i, new_y)
-                        if 0 <= pos[0] < game.size_x:
-                            positions.append(pos)
-
-        elif direction in ["diag1", "diag2"]:
-            # For diagonal sequences, get adjacent positions
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    for i in range(length):
-                        if direction == "diag1":
-                            pos = (base_x + i + dx, base_y + i + dy)
-                        else:
-                            pos = (base_x + i + dx, base_y + 2 - i + dy)
-
-                        if (0 <= pos[0] < game.size_x and 0 <= pos[1] < game.size_y):
-                            positions.append(pos)
-
-        return positions
-
-    def _find_junction_patterns(self, game):
-        """Find L-shaped and T-junction patterns"""
-
-        # Look for T-junction patterns (three-way intersections)
-        for x in range(1, game.size_x - 1):
-            for y in range(1, game.size_y - 1):
-                move = self._check_t_junction(game, x, y)
-                if move:
-                    return move
-
-        # Look for L-shaped patterns
-        for x in range(game.size_x - 1):
-            for y in range(game.size_y - 1):
-                move = self._check_l_patterns(game, x, y)
-                if move:
-                    return move
-
-        return None
-
-    def _check_t_junction(self, game, center_x, center_y):
-        """Check for T-junction patterns centered at a position"""
-
-        center_tile = game.tiles[center_x][center_y]
-
-        # Only analyze if center is revealed and has mines
-        if center_tile["state"] != STATE_CLICKED or center_tile["mines"] == 0:
-            return None
-
-        # Get cross-shaped neighbors (T-junction arms)
-        cross_positions = [
-            (center_x - 1, center_y),  # Up
-            (center_x + 1, center_y),  # Down
-            (center_x, center_y - 1),  # Left
-            (center_x, center_y + 1)  # Right
-        ]
-
-        # Check various T-junction configurations
-        for i in range(4):
-            # Try each rotation of T-junction
-            t_positions = [cross_positions[i], cross_positions[(i + 2) % 4], cross_positions[(i + 3) % 4]]
-
-            # Verify positions are valid
-            if all(0 <= x < game.size_x and 0 <= y < game.size_y for x, y in t_positions):
-                move = self._analyze_t_configuration(game, center_x, center_y, t_positions)
-                if move:
-                    return move
-
-        return None
-
-    def _analyze_t_configuration(self, game, center_x, center_y, t_positions):
-        """Analyze a specific T-junction configuration"""
-
-        center_mines = game.tiles[center_x][center_y]["mines"]
-
-        # Check if we can determine anything about the T-arms
-        revealed_arms = []
-        unknown_arms = []
-
-        for x, y in t_positions:
-            tile = game.tiles[x][y]
-            if tile["state"] == STATE_CLICKED:
-                revealed_arms.append((x, y, tile["mines"]))
-            elif tile["state"] == STATE_DEFAULT:
-                unknown_arms.append((x, y))
-
-        # If we have enough information, make deductions
-        if len(revealed_arms) >= 2 and len(unknown_arms) >= 1:
-            return self._deduce_from_t_junction(game, center_mines, revealed_arms, unknown_arms)
-
-        return None
-
-    def _deduce_from_t_junction(self, game, center_mines, revealed_arms, unknown_arms):
-        """Make deductions from T-junction analysis"""
-
-        # Analyze the relationship between center mines and arm mines
-        arm_mine_counts = [mines for _, _, mines in revealed_arms]
-
-        # If center has high mine count and arms have low counts,
-        # unknown positions likely have mines
-        if center_mines >= 3 and all(count <= 2 for count in arm_mine_counts):
-            for x, y in unknown_arms:
-                if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                    return ("flag", x, y)
-
-        # If center has low mine count and arms have high counts,
-        # unknown positions are likely safe
-        elif center_mines <= 2 and any(count >= 3 for count in arm_mine_counts):
-            for x, y in unknown_arms:
-                if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                    return ("click", x, y)
-
-        return None
-
-    def _check_l_patterns(self, game, start_x, start_y):
-        """Check for L-shaped patterns"""
-
-        # Define L-shape configurations (corner positions)
-        l_shapes = [
-            # L-shape orientations: [(dx1,dy1), (dx2,dy2), (corner_dx,corner_dy)]
-            [(0, 1), (1, 0), (1, 1)],  # Top-left L
-            [(0, 1), (-1, 0), (-1, 1)],  # Top-right L
-            [(0, -1), (1, 0), (1, -1)],  # Bottom-left L
-            [(0, -1), (-1, 0), (-1, -1)]  # Bottom-right L
-        ]
-
-        for shape in l_shapes:
-            move = self._analyze_l_shape(game, start_x, start_y, shape)
-            if move:
-                return move
-
-        return None
-
-    def _analyze_l_shape(self, game, base_x, base_y, l_shape):
-        """Analyze a specific L-shaped configuration"""
-
+                tile = game.tiles[x][y]
+
+                if tile["state"] == 0:
+                    state[x, y, 0] = 1.0
+                elif tile["state"] == 1:
+                    state[x, y, 1] = tile["mines"] / 8.0
+                elif tile["state"] == 2:
+                    state[x, y, 2] = 1.0
+
+                if tile["state"] == 1 and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    flagged = sum(1 for n in neighbors if n["state"] == 2)
+                    unknown = sum(1 for n in neighbors if n["state"] == 0)
+                    remaining = tile["mines"] - flagged
+
+                    if unknown > 0:
+                        state[x, y, 3] = remaining / unknown
+
+        return state
+
+
+def train_cnn_from_minefields():
+    """Enhanced training function with better error handling"""
+
+    trainer = CNNTrainer()
+
+    # Check if minefields file exists
+    if not os.path.exists("minefields.json"):
+        print("minefields.json not found.")
+        print("Please run the benchmark first to generate minefield data:")
+        print("python index.py --benchmark")
+        return
+
+    try:
+        with open("minefields.json", 'r') as f:
+            data = json.load(f)
+            available_difficulties = list(data.keys())
+    except Exception as e:
+        print(f"Error reading minefields.json: {e}")
+        return
+
+    print("Available difficulties:", available_difficulties)
+
+    for difficulty in available_difficulties:
+        print(f"\n=== Training CNN for {difficulty} ===")
         try:
-            # Get the three positions that form the L
-            pos1 = (base_x + l_shape[0][0], base_y + l_shape[0][1])
-            pos2 = (base_x + l_shape[1][0], base_y + l_shape[1][1])
-            corner = (base_x + l_shape[2][0], base_y + l_shape[2][1])
-
-            # Check bounds
-            positions = [pos1, pos2, corner]
-            if not all(0 <= x < game.size_x and 0 <= y < game.size_y for x, y in positions):
-                return None
-
-            # Get tiles
-            tile1 = game.tiles[pos1[0]][pos1[1]]
-            tile2 = game.tiles[pos2[0]][pos2[1]]
-            corner_tile = game.tiles[corner[0]][corner[1]]
-
-            # Check if we have revealed L-arms and unknown corner
-            if (tile1["state"] == STATE_CLICKED and tile2["state"] == STATE_CLICKED and
-                    corner_tile["state"] == STATE_DEFAULT):
-
-                return self._deduce_from_l_shape(game, tile1["mines"], tile2["mines"], corner)
-
-            # Check reverse: known corner, unknown arms
-            elif (corner_tile["state"] == STATE_CLICKED and
-                  tile1["state"] == STATE_DEFAULT and tile2["state"] == STATE_DEFAULT):
-
-                # For high corner values, arms likely have mines
-                if corner_tile["mines"] >= 4:
-                    return ("flag", pos1[0], pos1[1])
-                # For low corner values, arms likely safe
-                elif corner_tile["mines"] <= 1:
-                    return ("click", pos1[0], pos1[1])
-
-        except (IndexError, KeyError):
-            pass
-
-        return None
-
-    def _deduce_from_l_shape(self, game, mines1, mines2, corner_pos):
-        """Deduce corner tile from L-arm information"""
-
-        # L-shape corner logic:
-        # - If both arms have high mine counts, corner likely has mine
-        # - If both arms have low mine counts, corner likely safe
-        # - Mixed cases require more analysis
-
-        if mines1 >= 3 and mines2 >= 3:
-            # Both arms have many mines, corner likely mined
-            return ("flag", corner_pos[0], corner_pos[1])
-        elif mines1 <= 1 and mines2 <= 1:
-            # Both arms have few mines, corner likely safe
-            return ("click", corner_pos[0], corner_pos[1])
-        elif (mines1 >= 3 and mines2 <= 1) or (mines1 <= 1 and mines2 >= 3):
-            # Mixed case - corner probability depends on specific pattern
-            # Conservative approach: if one arm has many mines, corner might be safe
-            return ("click", corner_pos[0], corner_pos[1])
-
-        return None
-
-    def _find_geometric_patterns(self, game):
-        """Find complex geometric patterns like boxes, diamonds, etc."""
-
-        # Check 2x2 box patterns
-        for x in range(game.size_x - 1):
-            for y in range(game.size_y - 1):
-                move = self._check_box_pattern(game, x, y)
-                if move:
-                    return move
-
-        # Check diamond patterns (3x3 with center focus)
-        for x in range(1, game.size_x - 1):
-            for y in range(1, game.size_y - 1):
-                move = self._check_diamond_pattern(game, x, y)
-                if move:
-                    return move
-
-        # Check cross patterns
-        for x in range(1, game.size_x - 1):
-            for y in range(1, game.size_y - 1):
-                move = self._check_cross_pattern(game, x, y)
-                if move:
-                    return move
-
-        return None
-
-    def _check_box_pattern(self, game, x, y):
-        """Check 2x2 box patterns"""
-
-        # Get 2x2 box tiles
-        box_tiles = [
-            game.tiles[x][y], game.tiles[x][y + 1],
-            game.tiles[x + 1][y], game.tiles[x + 1][y + 1]
-        ]
-
-        # Count revealed and unknown tiles
-        revealed = [tile for tile in box_tiles if tile["state"] == STATE_CLICKED]
-        unknown = [tile for tile in box_tiles if tile["state"] == STATE_DEFAULT]
-
-        # Need at least 3 revealed tiles for pattern analysis
-        if len(revealed) >= 3 and len(unknown) >= 1:
-            return self._analyze_box_pattern(game, revealed, unknown)
-
-        return None
-
-    def _analyze_box_pattern(self, game, revealed_tiles, unknown_tiles):
-        """Analyze 2x2 box pattern"""
-
-        mine_counts = [tile["mines"] for tile in revealed_tiles]
-
-        # High-density box (many high numbers)
-        if sum(mine_counts) >= 9:  # Average > 3
-            # Unknown tile likely has mine
-            unknown_tile = unknown_tiles[0]
-            return ("flag", unknown_tile["coords"]["x"], unknown_tile["coords"]["y"])
-
-        # Low-density box (many low numbers)
-        elif sum(mine_counts) <= 3:  # Average <= 1
-            # Unknown tile likely safe
-            unknown_tile = unknown_tiles[0]
-            return ("click", unknown_tile["coords"]["x"], unknown_tile["coords"]["y"])
-
-        return None
-
-    def _check_diamond_pattern(self, game, center_x, center_y):
-        """Check diamond/cross patterns centered at a position"""
-
-        center_tile = game.tiles[center_x][center_y]
-
-        # Diamond positions (4-directional)
-        diamond_positions = [
-            (center_x - 1, center_y), (center_x + 1, center_y),
-            (center_x, center_y - 1), (center_x, center_y + 1)
-        ]
-
-        # Extended diamond (diagonal positions)
-        extended_positions = [
-            (center_x - 1, center_y - 1), (center_x - 1, center_y + 1),
-            (center_x + 1, center_y - 1), (center_x + 1, center_y + 1)
-        ]
-
-        return self._analyze_diamond_configuration(game, center_tile,
-                                                   diamond_positions, extended_positions)
-
-    def _analyze_diamond_configuration(self, game, center_tile, diamond_pos, extended_pos):
-        """Analyze diamond pattern configuration"""
-
-        if center_tile["state"] != STATE_CLICKED:
-            return None
-
-        center_mines = center_tile["mines"]
-
-        # Check primary diamond positions
-        diamond_tiles = []
-        diamond_unknown = []
-
-        for x, y in diamond_pos:
-            if 0 <= x < game.size_x and 0 <= y < game.size_y:
-                tile = game.tiles[x][y]
-                if tile["state"] == STATE_CLICKED:
-                    diamond_tiles.append(tile["mines"])
-                elif tile["state"] == STATE_DEFAULT:
-                    diamond_unknown.append((x, y))
-
-        # Analyze based on center mine count and surrounding pattern
-        if center_mines >= 5 and len(diamond_unknown) > 0:
-            # High center count suggests dense mine field
-            return ("flag", diamond_unknown[0][0], diamond_unknown[0][1])
-        elif center_mines <= 2 and len(diamond_unknown) > 0:
-            # Low center count suggests sparse mine field
-            return ("click", diamond_unknown[0][0], diamond_unknown[0][1])
-
-        return None
-
-    def _check_cross_pattern(self, game, center_x, center_y):
-        """Check cross (+) patterns"""
-
-        center_tile = game.tiles[center_x][center_y]
-
-        if center_tile["state"] != STATE_CLICKED:
-            return None
-
-        # Cross arms (further out)
-        cross_arms = [
-            (center_x - 2, center_y), (center_x + 2, center_y),
-            (center_x, center_y - 2), (center_x, center_y + 2)
-        ]
-
-        valid_arms = []
-        unknown_arms = []
-
-        for x, y in cross_arms:
-            if 0 <= x < game.size_x and 0 <= y < game.size_y:
-                tile = game.tiles[x][y]
-                if tile["state"] == STATE_CLICKED:
-                    valid_arms.append(tile["mines"])
-                elif tile["state"] == STATE_DEFAULT:
-                    unknown_arms.append((x, y))
-
-        # Cross pattern deductions
-        if len(valid_arms) >= 2 and len(unknown_arms) >= 1:
-            avg_arm_mines = sum(valid_arms) / len(valid_arms)
-            center_mines = center_tile["mines"]
-
-            # If center is much higher than arms, unknown arms likely safe
-            if center_mines >= avg_arm_mines + 2:
-                return ("click", unknown_arms[0][0], unknown_arms[0][1])
-            # If arms are high and center is high, unknown arms likely mined
-            elif center_mines >= 4 and avg_arm_mines >= 3:
-                return ("flag", unknown_arms[0][0], unknown_arms[0][1])
-
-        return None
-
-    def _find_probabilistic_patterns(self, game):
-        """Advanced probabilistic pattern matching"""
-
-        # This combines multiple weak patterns for probabilistic decisions
-        probability_map = {}
-
-        # Collect probability estimates from various sources
-        for x in range(game.size_x):
-            for y in range(game.size_y):
-                if game.tiles[x][y]["state"] == STATE_DEFAULT:
-                    prob = self._calculate_position_probability(game, x, y)
-                    if prob is not None:
-                        probability_map[(x, y)] = prob
-
-        if not probability_map:
-            return None
-
-        # Find positions with extreme probabilities
-        min_prob_pos = min(probability_map.items(), key=lambda x: x[1])
-        max_prob_pos = max(probability_map.items(), key=lambda x: x[1])
-
-        # Very safe positions (probability < 0.1)
-        if min_prob_pos[1] < 0.1:
-            return ("click", min_prob_pos[0][0], min_prob_pos[0][1])
-
-        # Very dangerous positions (probability > 0.9)
-        if max_prob_pos[1] > 0.9:
-            return ("flag", max_prob_pos[0][0], max_prob_pos[0][1])
-
-        # Moderately safe positions (probability < 0.3)
-        safe_positions = [(pos, prob) for pos, prob in probability_map.items() if prob < 0.3]
-        if safe_positions:
-            best_safe = min(safe_positions, key=lambda x: x[1])
-            return ("click", best_safe[0][0], best_safe[0][1])
-
-        return None
-
-    def _calculate_position_probability(self, game, x, y):
-        """Calculate mine probability for a position using multiple factors"""
-
-        # Get neighboring revealed tiles
-        neighbors = game.get_neighbors(x, y)
-        revealed_neighbors = [n for n in neighbors if n["state"] == STATE_CLICKED and n["mines"] > 0]
-
-        if not revealed_neighbors:
-            return None
-
-        # Factor 1: Basic constraint probability
-        constraint_probs = []
-        for neighbor in revealed_neighbors:
-            n_neighbors = game.get_neighbors(neighbor["coords"]["x"], neighbor["coords"]["y"])
-            unknown_count = sum(1 for n in n_neighbors if n["state"] == STATE_DEFAULT)
-            flagged_count = sum(1 for n in n_neighbors if n["state"] == STATE_FLAGGED)
-
-            if unknown_count > 0:
-                remaining_mines = neighbor["mines"] - flagged_count
-                basic_prob = max(0, remaining_mines) / unknown_count
-                constraint_probs.append(basic_prob)
-
-        if not constraint_probs:
-            return None
-
-        base_probability = sum(constraint_probs) / len(constraint_probs)
-
-        # Factor 2: Positional adjustments
-        positional_multiplier = 1.0
-
-        # Edge/corner adjustment
-        if x == 0 or x == game.size_x - 1 or y == 0 or y == game.size_y - 1:
-            positional_multiplier *= 0.9  # Slightly lower probability on edges
-
-        # High-number neighbor adjustment
-        high_number_neighbors = sum(1 for n in revealed_neighbors if n["mines"] >= 4)
-        if high_number_neighbors > 0:
-            positional_multiplier *= (1.0 + 0.2 * high_number_neighbors)
-
-        # Low-number neighbor adjustment
-        low_number_neighbors = sum(1 for n in revealed_neighbors if n["mines"] <= 1)
-        if low_number_neighbors > 0:
-            positional_multiplier *= (1.0 - 0.1 * low_number_neighbors)
-
-        # Factor 3: Pattern-based adjustment
-        pattern_multiplier = self._get_pattern_probability_adjustment(game, x, y)
-
-        final_probability = base_probability * positional_multiplier * pattern_multiplier
-        return max(0.0, min(1.0, final_probability))
-
-    def _get_pattern_probability_adjustment(self, game, x, y):
-        """Get probability adjustment based on local patterns"""
-
-        # Look for local patterns that affect probability
-        adjustment = 1.0
-
-        # Check for nearby number sequences
-        for dx, dy in [(0, 1), (1, 0), (1, 1), (1, -1)]:  # Different directions
-            sequence = []
-            for i in range(-2, 3):  # Check 5 positions in each direction
-                nx, ny = x + i * dx, y + i * dy
-                if 0 <= nx < game.size_x and 0 <= ny < game.size_y:
-                    tile = game.tiles[nx][ny]
-                    if tile["state"] == STATE_CLICKED:
-                        sequence.append(tile["mines"])
-                    else:
-                        sequence.append(None)
-
-            # Analyze sequence for patterns
-            if len([s for s in sequence if s is not None]) >= 3:
-                pattern_adj = self._analyze_sequence_for_probability(sequence, 2)  # Position 2 is our target
-                adjustment *= pattern_adj
-
-        return adjustment
-
-    def _analyze_sequence_for_probability(self, sequence, target_index):
-        """Analyze a sequence to adjust probability for target position"""
-
-        if target_index >= len(sequence) or sequence[target_index] is not None:
-            return 1.0
-
-        # Look for ascending/descending patterns
-        before_values = [s for s in sequence[:target_index] if s is not None]
-        after_values = [s for s in sequence[target_index + 1:] if s is not None]
-
-        if len(before_values) >= 2:
-            # Check if ascending
-            if all(before_values[i] < before_values[i + 1] for i in range(len(before_values) - 1)):
-                return 1.3  # Higher probability in ascending sequence
-            # Check if descending
-            elif all(before_values[i] > before_values[i + 1] for i in range(len(before_values) - 1)):
-                return 0.7  # Lower probability in descending sequence
-
-        return 1.0
-
-    def _smart_random_fallback(self, game):
-        """Intelligent random selection when no patterns are found"""
-
-        unknown_tiles = [(x, y) for x in range(game.size_x) for y in range(game.size_y)
-                         if game.tiles[x][y]["state"] == STATE_DEFAULT]
-
-        if not unknown_tiles:
-            return None
-
-        # Score each unknown tile
-        tile_scores = {}
-        for x, y in unknown_tiles:
-            score = self._calculate_fallback_score(game, x, y)
-            tile_scores[(x, y)] = score
-
-        # Choose from top 20% of tiles
-        sorted_tiles = sorted(tile_scores.items(), key=lambda x: x[1], reverse=True)
-        top_count = max(1, len(sorted_tiles) // 5)
-        best_tiles = [tile for tile, _ in sorted_tiles[:top_count]]
-
-        chosen = random.choice(best_tiles)
-        return ("click", chosen[0], chosen[1])
-
-    def _calculate_fallback_score(self, game, x, y):
-        """Calculate a score for fallback tile selection"""
-
-        score = 0
-        neighbors = game.get_neighbors(x, y)
-
-        # Prefer tiles with fewer high-number neighbors
-        high_numbers = sum(1 for n in neighbors if n["state"] == STATE_CLICKED and n["mines"] >= 4)
-        score -= high_numbers * 3
-
-        # Prefer tiles with more unknown neighbors (keeps options open)
-        unknown_neighbors = sum(1 for n in neighbors if n["state"] == STATE_DEFAULT)
-        score += unknown_neighbors
-
-        # Prefer tiles away from edges in late game
-        total_unknown = sum(1 for gx in range(game.size_x) for gy in range(game.size_y)
-                            if game.tiles[gx][gy]["state"] == STATE_DEFAULT)
-        total_tiles = game.size_x * game.size_y
-
-        if total_unknown < total_tiles * 0.3:  # Late game
-            # Prefer center tiles
-            center_x, center_y = game.size_x // 2, game.size_y // 2
-            distance_from_center = abs(x - center_x) + abs(y - center_y)
-            score -= distance_from_center * 0.5
-        else:  # Early/mid game
-            # Prefer edge tiles
-            is_edge = (x == 0 or x == game.size_x - 1 or y == 0 or y == game.size_y - 1)
-            if is_edge:
-                score += 2
-
-        return score
-
-    def _analyze_numbered_cluster(self, game, numbered_tiles, unknown_tiles):
-        """Analyze clusters of numbered tiles for pattern deduction"""
-
-        if len(numbered_tiles) < 2 or len(unknown_tiles) < 1:
-            return None
-
-        # Extract mine counts and positions
-        mine_counts = [tile["mines"] for tile in numbered_tiles]
-        positions = [(x, y) for x, y, tile in numbered_tiles]
-
-        # Look for specific cluster patterns
-        total_mines = sum(mine_counts)
-        avg_mines = total_mines / len(mine_counts)
-
-        # High-density cluster
-        if avg_mines >= 3.5:
-            # Unknown tiles likely have mines
-            unknown_pos = unknown_tiles[0][:2]
-            return ("flag", unknown_pos[0], unknown_pos[1])
-
-        # Low-density cluster
-        elif avg_mines <= 1.5:
-            # Unknown tiles likely safe
-            unknown_pos = unknown_tiles[0][:2]
-            return ("click", unknown_pos[0], unknown_pos[1])
-
-        # Check for specific number combinations
-        if len(numbered_tiles) == 3:
-            sorted_mines = sorted(mine_counts)
-
-            # 1-1-3 pattern
-            if sorted_mines == [1, 1, 3]:
-                unknown_pos = unknown_tiles[0][:2]
-                # Position near the 3 is likely a mine
-                return ("flag", unknown_pos[0], unknown_pos[1])
-
-            # 1-2-2 pattern
-            elif sorted_mines == [1, 2, 2]:
-                unknown_pos = unknown_tiles[0][:2]
-                # Moderate probability, lean toward safe
-                return ("click", unknown_pos[0], unknown_pos[1])
-
-        return None
+            if(difficulty == "Beginner"):
+                model = trainer.train(difficulty, max_games=100000, epochs=65)
+            elif(difficulty == "Intermediate"):
+                model = trainer.train(difficulty, max_games=200000, epochs=85)
+            else:
+                model = trainer.train(difficulty, max_games=400000, epochs=125)
+            if model:
+                print(f"✓ Training completed for {difficulty}")
+            else:
+                print(f"✗ Training failed for {difficulty}")
+        except Exception as e:
+            print(f"✗ Error training {difficulty}: {e}")
+
+    print("\n" + "=" * 50)
+    print("CNN Training Summary:")
+    print("- Models saved as: minesweeper_cnn_<difficulty>_<max_games>.keras")
+    print("- Use TrainedCNNStrategy to play with trained models")
+    print("- Models will automatically load when available")
+    print("=" * 50)
 
 
 STRATEGIES = {
-    "Random": RandomStrategy,
-    "AutoOpen": AutoOpenStrategy,
-    "Probabilistic": EnhancedProbabilisticStrategy,
-    "Pattern": AdvancedPatternStrategy,
-    "CSP": EnhancedCSPStrategy,
+    "Basic": AutoOpenStrategy,
+    "Probabilistics": ProbabilisticStrategy,
+    "CSP": CSPStrategy,
     "Hybrid": HybridStrategy,
+    "CNN": TrainedCNNStrategy,
 }
 
 # Game states
@@ -3065,6 +1985,7 @@ THEMES = {
         "flag_color": "#0066cc"
     }
 }
+
 
 class MinefieldGenerator:
     def __init__(self):
@@ -3354,7 +2275,7 @@ class StrategyBenchmark:
 
             # Print final result with newline
             print(f"\r{strategy_name} complete: {wins}/{total_maps} wins ({wins / total_maps * 100:.1f}%), "
-                  f"avg moves: {avg_moves:.1f}, avg flags: {avg_flags:.1f} (acc: {flag_accuracy:.1%})  ")
+                  f"avg moves: {avg_moves:.1f}, avg flags: {avg_flags:.1f} (flag acc: {flag_accuracy:.1%})  ")
 
         self.results[difficulty] = results
         return results
@@ -3456,15 +2377,16 @@ class StrategyBenchmark:
             for strategy, data in sorted_results:
                 print(f"{strategy}:")
                 print(f"  Win rate: {data['win_rate']:.2%} ({data['wins']}/{data['games']})")
-                print(f"  Avg moves: {data['avg_moves']:.2f}")
+                print(f"  Average moves: {data['avg_moves']:.2f}")
                 print(f"  Avg time: {data['avg_time']:.3f}s")
                 if data['avg_flags'] > 0:
-                    print(f"  Avg flags: {data['avg_flags']:.2f} (accuracy: {data['flag_accuracy']:.1%})")
+                    print(f"  Avg flags: {data['avg_flags']:.2f} (flag_accuracy: {data['flag_accuracy']:.1%})")
 
 
 def run_benchmark_cli():
     """Command-line interface for running benchmarks"""
     benchmark = StrategyBenchmark()
+    count = 0
 
     # Ask for configuration
     print("===== Minesweeper AI Strategy Benchmark =====")
@@ -3506,7 +2428,7 @@ def run_benchmark_cli():
 
         save_maps = input("Save generated maps? (y/n) [y]: ").lower() != "n"
         if save_maps:
-            filename = input("Filename [minefields.json]: ") or "minefields.json"
+            filename = input("Filename [minefields.json]: ") or f"minefields.json"
             benchmark.generator.save_maps(filename)
             print(f"Maps saved to {filename}")
     else:
@@ -3613,6 +2535,8 @@ def run_benchmark_cli():
     generate_graphs = input("Generate graphs from results? (y/n) [y]: ").lower() != "n"
     if generate_graphs:
         try:
+            base_dir = "benchmark_result"
+            os.makedirs(base_dir, exist_ok=True)
             import matplotlib.pyplot as plt
             import numpy as np
             from matplotlib.patches import Rectangle
@@ -3837,8 +2761,10 @@ def run_benchmark_cli():
                     ax9.text(score + 1, i, f'{score:.1f}', ha='left', va='center', fontweight='bold')
 
                 plt.tight_layout()
-                plt.savefig(f'comprehensive_analysis_{difficulty}.png', dpi=300, bbox_inches='tight',
-                            facecolor='white', edgecolor='none')
+                plt.savefig(
+                    os.path.join(base_dir, f"comprehensive_analysis_{difficulty}_{count}.png"),
+                    dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none'
+                )
                 plt.close()
 
                 # Additional detailed plots for each strategy
@@ -3915,13 +2841,15 @@ def run_benchmark_cli():
                             ax4.legend()
 
                         plt.tight_layout()
-                        plt.savefig(f'{strategy_name}_{difficulty}_detailed.png', dpi=300, bbox_inches='tight')
-                        plt.close()
+                        strategy_dir = os.path.join(base_dir, strategy_name)
+                        os.makedirs(strategy_dir, exist_ok=True)
 
+                        plt.savefig(
+                            os.path.join(strategy_dir, f"comprehensive_analysis_{difficulty}_{count}.png"),
+                            dpi=300, bbox_inches='tight'
+                        )
+                        plt.close()
             print("Comprehensive graphs generated and saved as PNG files.")
-            print("Generated files:")
-            print("- comprehensive_analysis_[difficulty].png (main dashboard)")
-            print("- [strategy]_[difficulty]_detailed.png (individual strategy analysis)")
 
         except ImportError:
             print("matplotlib and/or seaborn not installed. Skipping graph generation.")
@@ -4193,7 +3121,8 @@ class Minesweeper:
         self.tk = tk
         self.settings = Settings()
         self.stats = Statistics()
-        self.strategy_name = StringVar(value="Random")
+        first_strategy = next(iter(STRATEGIES))  # gets the first key of the dict
+        self.strategy_name = StringVar(value=first_strategy)
 
         # Initialize game variables
         self.size_x = DIFFICULTIES[self.settings.difficulty]["size_x"]
@@ -4201,7 +3130,8 @@ class Minesweeper:
         self.total_mines = DIFFICULTIES[self.settings.difficulty]["mines"]
 
         # Initialize AI with proper strategy instance
-        self.ai = MinesweeperAI(self, AutoOpenStrategy())
+        first_strategy_class = next(iter(STRATEGIES.values()))  # get the first class
+        self.ai = MinesweeperAI(self, first_strategy_class())
 
         self.create_menu()
         self.setup_ui()
@@ -4301,11 +3231,11 @@ class Minesweeper:
         stats_btn.pack(side="left", padx=(10, 0))
 
         # Strategy selection button
-        self.strategy_btn = Button(self.bottom_frame, text=f"Strategy: {self.strategy_name.get()}",
+        self.strategy_btn = Button(self.bottom_frame, text=f"Strategy: {self.strategy_name.get()} (F5)",
                                    command=self.cycle_strategy, font=("Arial", 10), padx=10, width=25)
         self.strategy_btn.pack(side="left", padx=(10, 0))
 
-        self.auto_play_btn = Button(self.bottom_frame, text="Auto Play", command=self.toggle_auto_play,
+        self.auto_play_btn = Button(self.bottom_frame, text="Auto Play (F6)", command=self.toggle_auto_play,
                                     font=("Arial", 10), padx=10, width=20)  # Add fixed width
         self.auto_play_btn.pack(side="left", padx=(10, 0))
 
@@ -4446,22 +3376,22 @@ class Minesweeper:
         img = PhotoImage(width=30, height=30)  # Changed from 20x20 to 30x30
 
         if image_type == "plain":
-            img.put(theme["button_bg"], to=(0, 0, 30, 30))
+            img.put(theme["button_bg"], to=(0, 0), width=30, height=30)
         elif image_type == "clicked":
-            img.put("#ffffff", to=(0, 0, 30, 30))
+            img.put("#ffffff", to=(0, 0), width=30, height=30)
         elif image_type == "mine":
-            img.put(theme["mine_color"], (0, 0, 30, 30))
+            img.put(theme["mine_color"], to=(0, 0), width=30, height=30)
         elif image_type == "flag":
-            img.put(theme["flag_color"], (0, 0, 30, 30))
+            img.put(theme["flag_color"], to=(0, 0), width=30, height=30)
         elif image_type == "wrong":
-            img.put("#888888", (0, 0, 30, 30))
+            img.put("#888888", to=(0, 0), width=30, height=30)
 
         return img
 
     def create_fallback_number_image(self, number):
         """Create fallback number images"""
         img = PhotoImage(width=20, height=20)
-        # img.put("#ffffff", (0, 0, 20, 20))
+        img.put("#ffffff", to=(0, 0), width=30, height=30)
         return img
 
     def setup(self):
@@ -4888,3 +3818,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #train_cnn_from_minefields()
