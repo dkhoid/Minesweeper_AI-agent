@@ -14,6 +14,11 @@ The application also includes:
 
 ## Run the Application
 To run the application, ensure you have Python installed and then execute the following command in your terminal:
+```
+pip install -r requirements.txt
+venv\Scripts\activate  
+```
+Then, to start the game, run:
 
 ```
 python index.py

@@ -21,20 +21,40 @@ keras = None
 layers = None
 
 def load_tensorflow():
-    """Lazy load TensorFlow only when needed"""
+    """Lazy load TensorFlow only when needed with better error handling"""
     global HAS_TENSORFLOW, tf, keras, layers
     if not HAS_TENSORFLOW and tf is None:
         try:
             print("Loading TensorFlow... (this may take a moment)")
-            import tensorflow as tf_module
+            
+            # Try different import methods
+            try:
+                import tensorflow as tf_module
+            except ImportError as e1:
+                print(f"Standard TensorFlow import failed: {e1}")
+                try:
+                    # Try alternative import
+                    import tensorflow.compat.v2 as tf_module
+                    tf_module.enable_v2_behavior()
+                except ImportError as e2:
+                    print(f"TensorFlow v2 import also failed: {e2}")
+                    raise ImportError("TensorFlow not available")
+            
             from tensorflow import keras as keras_module  
             from tensorflow.keras import layers as layers_module
             
-            # Configure TensorFlow for faster loading
+            # Test if TensorFlow is working
+            test_tensor = tf_module.constant([1, 2, 3])
+            
+            # Configure TensorFlow for better compatibility
             tf_module.config.set_soft_device_placement(True)
             
-            # Set CPU only
-            tf_module.config.set_visible_devices([], 'GPU')
+            # Set CPU only to avoid GPU issues
+            try:
+                tf_module.config.set_visible_devices([], 'GPU')
+                print("GPU disabled, using CPU only")
+            except:
+                print("Could not disable GPU, continuing anyway")
             
             tf = tf_module
             keras = keras_module
@@ -42,9 +62,11 @@ def load_tensorflow():
             HAS_TENSORFLOW = True
             print("TensorFlow loaded successfully!")
             
-        except ImportError:
-            print("TensorFlow not found. CNN will use pattern-based fallback.")
+        except Exception as e:
+            print(f"TensorFlow loading failed: {e}")
+            print("CNN will use pattern-based fallback.")
             HAS_TENSORFLOW = False
+            return False
     
     return HAS_TENSORFLOW
 
@@ -1536,7 +1558,7 @@ class CNNTrainer:
         training_examples = []
 
         for i, minefield in enumerate(minefields):
-            if i % 10000 == 0:
+            if i % 1000 == 0:
                 print(f"Processing minefield {i + 1}/{len(minefields)}")
 
             try:
@@ -1669,7 +1691,7 @@ class CNNTrainer:
     # Training
     # ---------------------------
 
-    def train(self, difficulty="Beginner", max_games=10000, epochs=25):
+    def train(self, difficulty="Beginner", max_games=5000, epochs=25):
         """Train the CNN with lazy TensorFlow loading and save to model folder"""
         # Load TensorFlow only when training is actually needed
         if not load_tensorflow():
@@ -1710,6 +1732,7 @@ class CNNTrainer:
         )
 
         # Save model to model folder with organized naming
+        #model_filename = f"minesweeper_cnn_{difficulty.lower()}.keras"
         model_filename = f"minesweeper_cnn_{difficulty.lower()}_{max_games}.keras"
         model_path = os.path.join("model", model_filename)
         
@@ -1724,24 +1747,23 @@ class CNNTrainer:
         
         return self.model
 
-
 class TrainedCNNStrategy(AIStrategy):
-    """CNN strategy using pre-trained model with lazy loading"""
+    """CNN strategy using pre-trained model with lazy loading and proper difficulty matching"""
 
-    def __init__(self, model_path=None, difficulty="Intermediate"):
-        self.fallback_strategy = AutoOpenStrategy()  # Fallback strategy
+    def __init__(self, model_path=None, difficulty="Beginner"):
+        self.fallback_strategy = AutoOpenStrategy()
         self.model = None
-        self.difficulty = difficulty
+        self.difficulty = difficulty.lower()  # Store as lowercase for consistency
         self.model_path = model_path
         self.tf_loaded = False
-        
+        self.model_input_shape = None  # Track expected input shape
+        self._shared_models = {}   # class-level cache
+        self.predict_fn = None
         # Create model directory if it doesn't exist
         os.makedirs("model", exist_ok=True)
-        
-        # Don't load model immediately - wait until first use
 
     def load_model(self, model_path):
-        """Load trained model with lazy TensorFlow loading"""
+        """Load trained model with lazy TensorFlow loading and shape validation"""
         if not self.tf_loaded:
             if not load_tensorflow():
                 print("TensorFlow not available, using fallback strategy")
@@ -1749,15 +1771,37 @@ class TrainedCNNStrategy(AIStrategy):
             self.tf_loaded = True
 
         try:
+            print(f"Attempting to load model: {model_path}")
             self.model = keras.models.load_model(model_path)
+            
+            # Store the expected input shape for validation
+            self.model_input_shape = self.model.input_shape[1:]  # Remove batch dimension
+            print(f"Model loaded successfully. Expected input shape: {self.model_input_shape}")
             return True
+            
         except Exception as e:
             print(f"Failed to load model {model_path}: {e}")
             self.model = None
+            self.model_input_shape = None
             return False
 
+    def _validate_game_compatibility(self, game):
+        """Check if the game dimensions match the model's expected input shape"""
+        if self.model is None or self.model_input_shape is None:
+            return False
+            
+        expected_x, expected_y = self.model_input_shape[:2]
+        actual_x, actual_y = game.size_x, game.size_y
+        
+        if expected_x != actual_x or expected_y != actual_y:
+            print(f"Game size mismatch: Model expects ({expected_x}x{expected_y}), "
+                  f"but game is ({actual_x}x{actual_y})")
+            return False
+            
+        return True
+
     def next_move(self, game):
-        """Get next move using CNN or fallback"""
+        """Get next move using CNN or fallback with proper compatibility checking"""
         # Always try deterministic moves first (fast)
         move = self._deterministic_moves(game)
         if move:
@@ -1765,49 +1809,105 @@ class TrainedCNNStrategy(AIStrategy):
 
         # Load model on first use if not already loaded
         if self.model is None and not self.tf_loaded:
-            # Define model paths to try (in order of preference)
-            model_paths = []
-            
-            # If specific path provided, try it first
-            if self.model_path:
-                model_paths.append(self.model_path)
-            
-            # Try standard paths in model folder
-            model_paths.extend([
-                f"model/minesweeper_cnn_{self.difficulty.lower()}.keras",
-
-            ])
-            
-            # Try root directory as fallback
-            model_paths.extend([
-                f"minesweeper_cnn_{self.difficulty.lower()}.keras",
-
-            ])
-            
-            model_loaded = False
-            for path in model_paths:
-                if os.path.exists(path):
-                    print(f"Found model at: {path}")
-                    if self.load_model(path):
-                        model_loaded = True
-                        break
+            model_loaded = self._try_load_appropriate_model(game)
             
             if not model_loaded:
-                print(f"No trained model found for {self.difficulty}.")
-                print(f"Searched in: {model_paths[:3]}")
+                print(f"No compatible trained model found for {self.difficulty}.")
                 print("Using fallback strategy.")
 
-        # Use CNN if available
+        # Use CNN if available and compatible
         if self.model is not None:
-            try:
-                move = self._cnn_prediction(game)
-                if move:
-                    return move
-            except Exception as e:
-                print(f"CNN prediction error: {e}")
+            if self._validate_game_compatibility(game):
+                try:
+                    move = self._cnn_prediction(game)
+                    if move:
+                        return move
+                except Exception as e:
+                    print(f"CNN prediction error: {e}")
+            else:
+                print("Model incompatible with current game size, using fallback")
 
         # Fall back to pattern-based strategy
         return self.fallback_strategy.next_move(game)
+    def _try_load_appropriate_model(self, game):
+        """Try to load a model that matches the current game configuration"""
+        # Define model paths to try (in order of preference)
+        model_paths = []
+        
+        # If specific path provided, try it first
+        if self.model_path:
+            model_paths.append(self.model_path)
+        
+        # Try to match difficulty and game size
+        game_size_key = f"{game.size_x}x{game.size_y}"
+        
+        # Map common game sizes to difficulties
+        size_to_difficulty = {
+            "9x9": "beginner",
+            "16x16": "intermediate", 
+            "16x30": "expert",
+            "30x16": "expert"
+        }
+        
+        # Try the difficulty that matches the game size first
+        if game_size_key in size_to_difficulty:
+            matched_difficulty = size_to_difficulty[game_size_key]
+            model_paths.extend([
+                f"model/minesweeper_cnn_{matched_difficulty}_5000.keras",
+                f"model/minesweeper_cnn_{matched_difficulty}_50000.keras",
+                f"model/minesweeper_cnn_{matched_difficulty}_100000.keras",
+                f"model/minesweeper_cnn_{matched_difficulty}_200000.keras",
+                f"model/minesweeper_cnn_{matched_difficulty}.keras",
+            ])
+        
+        # Validate and set default difficulty if needed
+        if self.difficulty not in ["beginner", "intermediate", "expert"]:
+            self.difficulty = "beginner"  # Default fallback
+        
+        # Then try the requested difficulty (if different from matched)
+        if game_size_key not in size_to_difficulty or size_to_difficulty[game_size_key] != self.difficulty:
+            model_paths.extend([
+                f"model/minesweeper_cnn_{self.difficulty}_5000.keras",
+                f"model/minesweeper_cnn_{self.difficulty}_50000.keras",
+                f"model/minesweeper_cnn_{self.difficulty}_100000.keras",
+                f"model/minesweeper_cnn_{self.difficulty}_200000.keras",
+                f"model/minesweeper_cnn_{self.difficulty}.keras",
+            ])
+        
+        # Try all other difficulties as fallback
+        for diff in ["beginner", "intermediate", "expert"]:
+            # Skip if we already tried this difficulty
+            skip_diff = False
+            if game_size_key in size_to_difficulty and size_to_difficulty[game_size_key] == diff:
+                skip_diff = True
+            if diff == self.difficulty:
+                skip_diff = True
+                
+            if not skip_diff:
+                model_paths.extend([
+                    f"model/minesweeper_cnn_{diff}_5000.keras",
+                    f"model/minesweeper_cnn_{diff}_50000.keras",
+                    f"model/minesweeper_cnn_{diff}_100000.keras",
+                    f"model/minesweeper_cnn_{diff}_200000.keras",
+                    f"model/minesweeper_cnn_{diff}.keras",
+                ])
+        
+        # Try to load any available model
+        model_loaded = False
+        for path in model_paths:
+            if os.path.exists(path):
+                print(f"Found model at: {path}")
+                if self.load_model(path):
+                    # Check if this model is compatible with current game
+                    if self._validate_game_compatibility(game):
+                        model_loaded = True
+                        print(f"Model {path} is compatible with current game")
+                        break
+                    else:
+                        print(f"Model {path} is not compatible with current game size")
+                        self.model = None  # Reset model
+        
+        return model_loaded
 
     def _deterministic_moves(self, game):
         """Find certain moves (no TensorFlow needed)"""
@@ -1836,14 +1936,31 @@ class TrainedCNNStrategy(AIStrategy):
             return None
             
         state = self._encode_state(game)
+        
+        # Validate state shape matches model expectations
+        if state.shape != self.model_input_shape:
+            print(f"State shape {state.shape} doesn't match model input {self.model_input_shape}")
+            return None
+            
         state_batch = tf.expand_dims(state, axis=0)
 
-        predictions = self.model.predict(state_batch, verbose=0)[0]
+        try:
+            # Create prediction function if not exists
+            if self.predict_fn is None:
+                self.predict_fn = tf.function(
+                    lambda x: self.model(x, training=False),
+                    input_signature=[tf.TensorSpec(shape=[None] + list(self.model_input_shape), dtype=tf.float32)]
+                )
+            
+            predictions = self.predict_fn(state_batch)[0].numpy()
+        except Exception as e:
+            print(f"Model prediction failed: {e}")
+            return None
 
         # Find best action
         unknown_cells = [(x, y) for x in range(game.size_x)
-                         for y in range(game.size_y)
-                         if game.tiles[x][y]["state"] == 0]
+                        for y in range(game.size_y)
+                        if game.tiles[x][y]["state"] == 0]
 
         if not unknown_cells:
             return None
@@ -1853,10 +1970,11 @@ class TrainedCNNStrategy(AIStrategy):
         safest_cell = None
 
         for x, y in unknown_cells:
-            mine_prob = predictions[x, y]
-            if mine_prob < safest_prob:
-                safest_prob = mine_prob
-                safest_cell = (x, y)
+            if x < predictions.shape[0] and y < predictions.shape[1]:
+                mine_prob = predictions[x, y]
+                if mine_prob < safest_prob:
+                    safest_prob = mine_prob
+                    safest_cell = (x, y)
 
         if safest_cell:
             x, y = safest_cell
@@ -1866,8 +1984,8 @@ class TrainedCNNStrategy(AIStrategy):
             elif safest_prob < 0.3:
                 return ("click", x, y)
 
-        return None
-
+            return None
+        
     def _encode_state(self, game):
         """Encode game state for CNN"""
         import numpy as np
@@ -1896,52 +2014,6 @@ class TrainedCNNStrategy(AIStrategy):
                         state[x, y, 3] = remaining / unknown
 
         return state
-
-
-def train_cnn_from_minefields():
-    """Enhanced training function with better error handling"""
-
-    trainer = CNNTrainer()
-
-    # Check if minefields file exists
-    if not os.path.exists("minefields.json"):
-        print("minefields.json not found.")
-        print("Please run the benchmark first to generate minefield data:")
-        print("python index.py --benchmark")
-        return
-
-    try:
-        with open("minefields.json", 'r') as f:
-            data = json.load(f)
-            available_difficulties = list(data.keys())
-    except Exception as e:
-        print(f"Error reading minefields.json: {e}")
-        return
-
-    print("Available difficulties:", available_difficulties)
-
-    for difficulty in available_difficulties:
-        print(f"\n=== Training CNN for {difficulty} ===")
-        try:
-            if(difficulty == "Beginner"):
-                model = trainer.train(difficulty, max_games=100000, epochs=65)
-            elif(difficulty == "Intermediate"):
-                model = trainer.train(difficulty, max_games=200000, epochs=85)
-            else:
-                model = trainer.train(difficulty, max_games=400000, epochs=125)
-            if model:
-                print(f"✓ Training completed for {difficulty}")
-            else:
-                print(f"✗ Training failed for {difficulty}")
-        except Exception as e:
-            print(f"✗ Error training {difficulty}: {e}")
-
-    print("\n" + "=" * 50)
-    print("CNN Training Summary:")
-    print("- Models saved as: minesweeper_cnn_<difficulty>_<max_games>.keras")
-    print("- Use TrainedCNNStrategy to play with trained models")
-    print("- Models will automatically load when available")
-    print("=" * 50)
 
 
 STRATEGIES = {
@@ -2187,7 +2259,6 @@ class HeadlessMinesweeper:
                 for nx, ny in self.get_neighbors_coords(x, y):
                     queue.append((nx, ny))
 
-
 class StrategyBenchmark:
     """Benchmark different AI strategies on the same minefield maps"""
 
@@ -2208,7 +2279,7 @@ class StrategyBenchmark:
         return self.generator.saved_maps
 
     def run_benchmark(self, difficulty="Beginner", strategies=None):
-        """Run benchmark on all maps for given strategies"""
+        """Run benchmark on all maps for given strategies with strategy reuse"""
         if strategies is None:
             strategies = STRATEGIES
 
@@ -2226,7 +2297,22 @@ class StrategyBenchmark:
         results = {}
         total_maps = len(maps)
 
-        for strategy_name, strategy_class in valid_strategies.items():
+        # Create strategy instances ONCE for all games
+        strategy_instances = {}
+        print("Initializing strategies...")
+        for strategy_name, strategy_factory in valid_strategies.items():
+            try:
+                if callable(strategy_factory) and not isinstance(strategy_factory, type):
+                    # It's a lambda or function, call it to get the instance
+                    strategy_instances[strategy_name] = strategy_factory()
+                else:
+                    # It's a class, instantiate it
+                    strategy_instances[strategy_name] = strategy_factory()
+                print(f"✓ {strategy_name} initialized")
+            except Exception as e:
+                print(f"✗ Failed to initialize {strategy_name}: {e}")
+
+        for strategy_name, strategy_instance in strategy_instances.items():
             print(f"\nRunning {strategy_name} strategy on {total_maps} {difficulty} maps...")
             strategy_results = []
             wins = 0
@@ -2235,17 +2321,19 @@ class StrategyBenchmark:
             total_flags = 0
             total_correct_flags = 0
 
-            # Create progress indicator
+            # Use the SAME strategy instance for all games
             for i, mine_map in enumerate(maps):
-                # Update progress in real-time
                 progress = f"[{i + 1}/{total_maps}]"
-                if i > 0:  # Avoid division by zero
+                if i > 0:
                     avg_moves_so_far = total_moves / i
-                    print(f"\r{progress} Testing {strategy_name}: {wins}/{i} wins, avg moves: {avg_moves_so_far:.1f}",
-                          end="", flush=True)
+                    print(f"\r{progress} Testing {strategy_name}: {wins}/{i} wins, avg moves: {avg_moves_so_far:.1f}", end="", flush=True)
 
-                # Run strategy on map
-                result = self._test_strategy_on_map(strategy_class, mine_map, progress)
+                # Reset strategy state if needed (but keep the loaded model)
+                if hasattr(strategy_instance, 'reset'):
+                    strategy_instance.reset()
+
+                # Run strategy on map with the SAME instance
+                result = self._test_strategy_on_map(strategy_instance, mine_map, progress)
                 strategy_results.append(result)
 
                 # Update running statistics
@@ -2280,11 +2368,10 @@ class StrategyBenchmark:
         self.results[difficulty] = results
         return results
 
-    def _test_strategy_on_map(self, strategy_class, mine_map, progress=""):
-        """Test a single strategy on a single map"""
+    def _test_strategy_on_map(self, strategy_instance, mine_map, progress=""):
+        """Test a single strategy INSTANCE on a single map"""
         try:
             game = HeadlessMinesweeper(mine_map)
-            strategy = strategy_class()
 
             start_time = time.time()
             move_count = 0
@@ -2306,16 +2393,16 @@ class StrategyBenchmark:
                 }
 
             # Run strategy until game over or move limit reached
-            max_moves = game.size_x * game.size_y * 2  # Reasonable upper limit
+            max_moves = game.size_x * game.size_y * 2
             while not game.game_over_flag and move_count < max_moves:
                 try:
-                    move = strategy.next_move(game)
+                    move = strategy_instance.next_move(game)  # Use instance, not class
                     if move is None:
                         break
 
                     # Validate move format
                     if not isinstance(move, (list, tuple)) or len(move) != 3:
-                        print(f"Invalid move format from {strategy.__class__.__name__}: {move}")
+                        print(f"Invalid move format from {strategy_instance.__class__.__name__}: {move}")
                         break
 
                     move_type, x, y = move
@@ -2331,7 +2418,7 @@ class StrategyBenchmark:
                         break
 
                 except Exception as e:
-                    print(f"Error in strategy {strategy.__class__.__name__}: {e}")
+                    print(f"Error in strategy {strategy_instance.__class__.__name__}: {e}")
                     break
 
             elapsed = time.time() - start_time
@@ -2367,7 +2454,6 @@ class StrategyBenchmark:
         """Print summary of benchmark results"""
         for difficulty, results in self.results.items():
             print(f"\n=== {difficulty} ===")
-            # Sort by win rate, then by average moves
             sorted_results = sorted(
                 results.items(),
                 key=lambda x: (x[1]["win_rate"], -x[1]["avg_moves"]),
@@ -2382,13 +2468,325 @@ class StrategyBenchmark:
                 if data['avg_flags'] > 0:
                     print(f"  Avg flags: {data['avg_flags']:.2f} (flag_accuracy: {data['flag_accuracy']:.1%})")
 
+class TrainedCNNStrategy(AIStrategy):
+    """CNN strategy using pre-trained model with lazy loading and proper difficulty matching"""
 
+    def __init__(self, model_path=None, difficulty="Beginner"):
+        self.fallback_strategy = AutoOpenStrategy()
+        self.model = None
+        self.difficulty = difficulty.lower()
+        self.model_path = model_path
+        self.tf_loaded = False
+        self.model_input_shape = None
+        self.model_loaded_once = False  # Track if we've attempted loading
+        
+        os.makedirs("model", exist_ok=True)
+
+    def reset(self):
+        """Reset strategy state for new game (but keep loaded model)"""
+        # Don't reset model or tf_loaded - keep them for reuse
+        # Only reset per-game state if you have any
+        pass
+
+    def load_model(self, model_path):
+        """Load trained model with lazy TensorFlow loading and shape validation"""
+        if not self.tf_loaded:
+            if not load_tensorflow():
+                print("TensorFlow not available, using fallback strategy")
+                return False
+            self.tf_loaded = True
+
+        try:
+            print(f"Loading model: {model_path}")
+            self.model = keras.models.load_model(model_path)
+            self.model_input_shape = self.model.input_shape[1:]
+            print(f"Model loaded. Input shape: {self.model_input_shape}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to load model {model_path}: {e}")
+            self.model = None
+            self.model_input_shape = None
+            return False
+
+    def _validate_game_compatibility(self, game):
+        """Check if the game dimensions match the model's expected input shape"""
+        if self.model is None or self.model_input_shape is None:
+            return False
+            
+        expected_x, expected_y = self.model_input_shape[:2]
+        actual_x, actual_y = game.size_x, game.size_y
+        
+        if expected_x != actual_x or expected_y != actual_y:
+            if not hasattr(self, '_warned_about_size'):
+                print(f"Game size mismatch: Model expects ({expected_x}x{expected_y}), "
+                      f"but game is ({actual_x}x{actual_y})")
+                self._warned_about_size = True
+            return False
+            
+        return True
+
+    def next_move(self, game):
+        """Get next move using CNN or fallback with proper compatibility checking"""
+        # Always try deterministic moves first (fast)
+        move = self._deterministic_moves(game)
+        if move:
+            return move
+
+        # Load model only ONCE per strategy instance
+        if self.model is None and not self.model_loaded_once:
+            self.model_loaded_once = True  # Prevent repeated attempts
+            model_loaded = self._try_load_appropriate_model(game)
+            
+            if not model_loaded:
+                print(f"No compatible trained model found for {self.difficulty}.")
+                print("Using fallback strategy for all games.")
+
+        # Use CNN if available and compatible
+        if self.model is not None:
+            if self._validate_game_compatibility(game):
+                try:
+                    move = self._cnn_prediction(game)
+                    if move:
+                        return move
+                except Exception as e:
+                    print(f"CNN prediction error: {e}")
+
+        # Fall back to pattern-based strategy
+        return self.fallback_strategy.next_move(game)
+
+        
+
+    def _try_load_appropriate_model(self, game):
+        """Try to load a model that matches the current game configuration"""
+        # Define model paths to try (in order of preference)
+        model_paths = []
+        
+        # If specific path provided, try it first
+        if self.model_path:
+            model_paths.append(self.model_path)
+        
+        # Try to match difficulty and game size
+        game_size_key = f"{game.size_x}x{game.size_y}"
+        
+        # Map common game sizes to difficulties
+        size_to_difficulty = {
+            "9x9": "beginner",
+            "16x16": "intermediate", 
+            "16x30": "expert",
+            "30x16": "expert"
+        }
+        
+        # Try the difficulty that matches the game size first
+        if game_size_key in size_to_difficulty:
+            matched_difficulty = size_to_difficulty[game_size_key]
+            model_paths.extend([
+                 model_paths.extend([
+                    f"model/minesweeper_cnn_{diff}_50000.keras",
+                    f"model/minesweeper_cnn_{diff}_100000.keras",
+                    f"model/minesweeper_cnn_{diff}_200000.keras",
+                    f"model/minesweeper_cnn_{diff}.keras",
+                ])
+            ])
+        
+        # Then try the requested difficulty
+        if self.difficulty not in ["beginner", "intermediate", "expert"]:
+            self.difficulty = "beginner"  # Default fallback
+            
+        model_paths.extend([
+            model_paths.extend([
+                    f"model/minesweeper_cnn_{diff}_50000.keras",
+                    f"model/minesweeper_cnn_{diff}_100000.keras",
+                    f"model/minesweeper_cnn_{diff}_200000.keras",
+                    f"model/minesweeper_cnn_{diff}.keras",
+                ])
+        ])
+        
+        # Try all difficulties as fallback
+        for diff in ["beginner", "intermediate", "expert"]:
+            if diff != self.difficulty:
+                model_paths.extend([
+                    f"model/minesweeper_cnn_{diff}_50000.keras",
+                    f"model/minesweeper_cnn_{diff}_100000.keras",
+                    f"model/minesweeper_cnn_{diff}_200000.keras",
+                    f"model/minesweeper_cnn_{diff}.keras",
+                ])
+        
+        # Try to load any available model
+        model_loaded = False
+        for path in model_paths:
+            if os.path.exists(path):
+                print(f"Found model at: {path}")
+                if self.load_model(path):
+                    # Check if this model is compatible with current game
+                    if self._validate_game_compatibility(game):
+                        model_loaded = True
+                        print(f"Model {path} is compatible with current game")
+                        break
+                    else:
+                        print(f"Model {path} is not compatible with current game size")
+                        self.model = None  # Reset model
+        
+        return model_loaded
+
+    def _deterministic_moves(self, game):
+        """Find certain moves (no TensorFlow needed)"""
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+                if tile["state"] != 1 or tile["mines"] == 0:
+                    continue
+
+                neighbors = game.get_neighbors(x, y)
+                flagged = sum(1 for n in neighbors if n["state"] == 2)
+                unknown = [n for n in neighbors if n["state"] == 0]
+                remaining = tile["mines"] - flagged
+
+                if remaining == 0 and unknown:
+                    n = unknown[0]
+                    return ("click", n["coords"]["x"], n["coords"]["y"])
+                elif remaining == len(unknown) and remaining > 0:
+                    n = unknown[0]
+                    return ("flag", n["coords"]["x"], n["coords"]["y"])
+        return None
+
+    def _cnn_prediction(self, game):
+        """Use CNN to predict mine probabilities"""
+        if self.model is None:
+            return None
+            
+        state = self._encode_state(game)
+        
+        # Validate state shape matches model expectations
+        if state.shape != self.model_input_shape:
+            print(f"State shape {state.shape} doesn't match model input {self.model_input_shape}")
+            return None
+            
+        state_batch = tf.expand_dims(state, axis=0)
+
+        try:
+            predictions = self.model.predict(state_batch, verbose=0)[0]
+        except Exception as e:
+            print(f"Model prediction failed: {e}")
+            return None
+
+        # Find best action
+        unknown_cells = [(x, y) for x in range(game.size_x)
+                         for y in range(game.size_y)
+                         if game.tiles[x][y]["state"] == 0]
+
+        if not unknown_cells:
+            return None
+
+        # Find safest cell
+        safest_prob = float('inf')
+        safest_cell = None
+
+        for x, y in unknown_cells:
+            if x < predictions.shape[0] and y < predictions.shape[1]:
+                mine_prob = predictions[x, y]
+                if mine_prob < safest_prob:
+                    safest_prob = mine_prob
+                    safest_cell = (x, y)
+
+        if safest_cell:
+            x, y = safest_cell
+            # Flag if very confident it's a mine, click if confident it's safe
+            if safest_prob > 0.8:
+                return ("flag", x, y)
+            elif safest_prob < 0.3:
+                return ("click", x, y)
+
+        return None
+
+    def _encode_state(self, game):
+        """Encode game state for CNN"""
+        import numpy as np
+        
+        channels = 4
+        state = np.zeros((game.size_x, game.size_y, channels), dtype=np.float32)
+
+        for x in range(game.size_x):
+            for y in range(game.size_y):
+                tile = game.tiles[x][y]
+
+                if tile["state"] == 0:
+                    state[x, y, 0] = 1.0
+                elif tile["state"] == 1:
+                    state[x, y, 1] = tile["mines"] / 8.0
+                elif tile["state"] == 2:
+                    state[x, y, 2] = 1.0
+
+                if tile["state"] == 1 and tile["mines"] > 0:
+                    neighbors = game.get_neighbors(x, y)
+                    flagged = sum(1 for n in neighbors if n["state"] == 2)
+                    unknown = sum(1 for n in neighbors if n["state"] == 0)
+                    remaining = tile["mines"] - flagged
+
+                    if unknown > 0:
+                        state[x, y, 3] = remaining / unknown
+
+        return state
+
+
+# Enhanced TensorFlow loading function
+def load_tensorflow():
+    """Lazy load TensorFlow only when needed with better error handling"""
+    global HAS_TENSORFLOW, tf, keras, layers
+    if not HAS_TENSORFLOW and tf is None:
+        try:
+            print("Loading TensorFlow... (this may take a moment)")
+            
+            # Try different import methods
+            try:
+                import tensorflow as tf_module
+            except ImportError as e1:
+                print(f"Standard TensorFlow import failed: {e1}")
+                try:
+                    # Try alternative import
+                    import tensorflow.compat.v2 as tf_module
+                    tf_module.enable_v2_behavior()
+                except ImportError as e2:
+                    print(f"TensorFlow v2 import also failed: {e2}")
+                    raise ImportError("TensorFlow not available")
+            
+            from tensorflow import keras as keras_module  
+            from tensorflow.keras import layers as layers_module
+            
+            # Test if TensorFlow is working
+            test_tensor = tf_module.constant([1, 2, 3])
+            
+            # Configure TensorFlow for better compatibility
+            tf_module.config.set_soft_device_placement(True)
+            
+            # Set CPU only to avoid GPU issues
+            try:
+                tf_module.config.set_visible_devices([], 'GPU')
+                print("GPU disabled, using CPU only")
+            except:
+                print("Could not disable GPU, continuing anyway")
+            
+            tf = tf_module
+            keras = keras_module
+            layers = layers_module
+            HAS_TENSORFLOW = True
+            print("TensorFlow loaded successfully!")
+            
+        except Exception as e:
+            print(f"TensorFlow loading failed: {e}")
+            print("CNN will use pattern-based fallback.")
+            HAS_TENSORFLOW = False
+            return False
+    
+    return HAS_TENSORFLOW
+
+
+# Enhanced benchmark function with better strategy selection
 def run_benchmark_cli():
-    """Command-line interface for running benchmarks"""
+    """Command-line interface for running benchmarks with proper difficulty mapping"""
     benchmark = StrategyBenchmark()
     count = 0
 
-    # Ask for configuration
     print("===== Minesweeper AI Strategy Benchmark =====")
     print("1. Generate new maps")
     print("2. Load existing maps")
@@ -2400,15 +2798,15 @@ def run_benchmark_cli():
 
     if choice == "1":
         print("\nDifficulty levels:")
-        print("1. Beginner")
-        print("2. Intermediate")
-        print("3. Expert")
+        print("1. Beginner (9x9, 10 mines)")
+        print("2. Intermediate (16x16, 40 mines)")
+        print("3. Expert (16x30, 99 mines)")
 
         difficulty_input = input("Select difficulty (1-3) [1]: ") or "1"
 
         difficulty_map = {
             "1": "Beginner",
-            "2": "Intermediate",
+            "2": "Intermediate", 
             "3": "Expert"
         }
 
@@ -2428,7 +2826,7 @@ def run_benchmark_cli():
 
         save_maps = input("Save generated maps? (y/n) [y]: ").lower() != "n"
         if save_maps:
-            filename = input("Filename [minefields.json]: ") or f"minefields.json"
+            filename = input("Filename [minefields.json]: ") or "minefields.json"
             benchmark.generator.save_maps(filename)
             print(f"Maps saved to {filename}")
     else:
@@ -2438,7 +2836,7 @@ def run_benchmark_cli():
             difficulties = list(benchmark.generator.saved_maps.keys())
             print(f"Available difficulties: {', '.join(difficulties)}")
 
-            # Create mapping for available difficulties
+
             if difficulties:
                 print("\nSelect difficulty:")
                 for i, diff in enumerate(difficulties, 1):
@@ -2452,8 +2850,7 @@ def run_benchmark_cli():
                         difficulty = difficulties[diff_index]
                         print(f"Selected: {difficulty}")
                     else:
-                        print(
-                            f"Invalid choice '{diff_input}'. Please enter a number between 1 and {len(difficulties)}.")
+                        print(f"Invalid choice '{diff_input}'. Please enter a number between 1 and {len(difficulties)}.")
                         return
                 except ValueError:
                     print(f"Invalid input '{diff_input}'. Please enter a number.")
@@ -2463,10 +2860,9 @@ def run_benchmark_cli():
         else:
             print(f"Could not load {filename}. Generating new Beginner maps...")
             difficulty = "Beginner"
-            count = 100
-            benchmark.prepare_maps(difficulty, count)
+            benchmark.prepare_maps(difficulty, 100)
 
-    # Select strategies
+    # Enhanced strategy selection with proper CNN difficulty matching
     available_strategies = [name for name, cls in STRATEGIES.items() if cls is not None]
     if not available_strategies:
         print("No strategies available! Please add strategy classes to the STRATEGIES dictionary.")
@@ -2480,33 +2876,41 @@ def run_benchmark_cli():
     strategy_input = input("Strategy selection: ").strip()
 
     if not strategy_input:
-        # Select all strategies
-        selected_strategies = {name: cls for name, cls in STRATEGIES.items() if cls is not None}
+        # Select all strategies, but configure CNN with correct difficulty
+        selected_strategies = {}
+        for name, cls in STRATEGIES.items():
+            if cls is not None:
+                if name == "CNN" or "CNN" in name:
+                    # Create CNN strategy with matching difficulty
+                    selected_strategies[name] = lambda: TrainedCNNStrategy(difficulty=difficulty)
+                else:
+                    selected_strategies[name] = cls
         print("Selected: All strategies")
     else:
         selected_strategies = {}
 
         try:
-            # Parse input - support both comma-separated and ranges
             selections = []
             for part in strategy_input.split(','):
                 part = part.strip()
                 if '-' in part:
-                    # Handle range like "1-3"
                     start, end = map(int, part.split('-'))
                     selections.extend(range(start, end + 1))
                 else:
-                    # Handle single number
                     selections.append(int(part))
 
-            # Validate and convert to strategy names
             for num in selections:
                 if 1 <= num <= len(available_strategies):
                     strategy_name = available_strategies[num - 1]
-                    selected_strategies[strategy_name] = STRATEGIES[strategy_name]
+                    strategy_cls = STRATEGIES[strategy_name]
+                    
+                    # Special handling for CNN strategy
+                    if strategy_name == "CNN" or "CNN" in strategy_name:
+                        selected_strategies[strategy_name] = lambda: TrainedCNNStrategy(difficulty=difficulty)
+                    else:
+                        selected_strategies[strategy_name] = strategy_cls
                 else:
-                    print(
-                        f"Invalid strategy number '{num}'. Please enter numbers between 1 and {len(available_strategies)}.")
+                    print(f"Invalid strategy number '{num}'. Please enter numbers between 1 and {len(available_strategies)}.")
                     return
 
             if selected_strategies:
@@ -2519,9 +2923,20 @@ def run_benchmark_cli():
             print("Invalid input format. Use numbers separated by commas (e.g., '1,2,3') or ranges (e.g., '1-3').")
             return
 
-    # Run benchmark
+    # Run benchmark with proper strategy instantiation
     print(f"\nRunning benchmark for {len(selected_strategies)} strategies on {difficulty}...")
-    benchmark.run_benchmark(difficulty, selected_strategies)
+    
+    # Convert lambda functions to actual strategy classes for the benchmark
+    strategy_instances = {}
+    for name, strategy_factory in selected_strategies.items():
+        if callable(strategy_factory) and not isinstance(strategy_factory, type):
+            # It's a lambda or function, call it to get the instance
+            strategy_instances[name] = strategy_factory
+        else:
+            # It's a class, use it directly
+            strategy_instances[name] = strategy_factory
+    
+    benchmark.run_benchmark(difficulty, strategy_instances)
 
     # Show results
     benchmark.print_summary()
@@ -2762,7 +3177,7 @@ def run_benchmark_cli():
 
                 plt.tight_layout()
                 plt.savefig(
-                    os.path.join(base_dir, f"comprehensive_analysis_{difficulty}_{count}.png"),
+                    os.path.join(base_dir, f"comprehensive_analysis_{difficulty}.png"),
                     dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none'
                 )
                 plt.close()
@@ -2845,7 +3260,7 @@ def run_benchmark_cli():
                         os.makedirs(strategy_dir, exist_ok=True)
 
                         plt.savefig(
-                            os.path.join(strategy_dir, f"comprehensive_analysis_{difficulty}_{count}.png"),
+                            os.path.join(strategy_dir, f"{strategy_name}_{difficulty}.png"),
                             dpi=300, bbox_inches='tight'
                         )
                         plt.close()
@@ -2858,6 +3273,145 @@ def run_benchmark_cli():
             print(f"Error generating graphs: {e}")
             import traceback
             traceback.print_exc()
+
+
+
+def train_cnn_from_minefields():
+    """Enhanced training function with interactive map generation and training"""
+    
+    trainer = CNNTrainer()
+    
+    print("\nDifficulty levels:")
+    print("1. Beginner (9x9, 10 mines)")
+    print("2. Intermediate (16x16, 40 mines)")
+    print("3. Expert (16x30, 99 mines)")
+
+    difficulty_input = input("Select difficulty (1-3) [1]: ") or "1"
+
+    difficulty_map = {
+        "1": "Beginner",
+        "2": "Intermediate", 
+        "3": "Expert"
+    }
+
+    if difficulty_input not in difficulty_map:
+        print(f"Invalid difficulty choice '{difficulty_input}'. Please enter 1, 2, or 3.")
+        return
+
+    difficulty = difficulty_map[difficulty_input]
+    print(f"Selected: {difficulty}")
+
+    count = int(input("Number of maps [100]: ") or "100")
+    seed = input("Random seed (leave empty for random): ")
+    seed = int(seed) if seed else None
+
+    print(f"Generating {count} maps for {difficulty}...")
+    
+    benchmark = StrategyBenchmark()
+    
+    benchmark.prepare_maps(difficulty, count, seed)
+
+    save_maps = input("Save generated maps? (y/n) [y]: ").lower() != "n"
+    filename = f"minefields_{difficulty.lower()}.json"
+    
+    if save_maps:
+        custom_filename = input(f"Filename [{filename}]: ") or filename
+        benchmark.generator.save_maps(custom_filename)
+        print(f"Maps saved to {custom_filename}")
+        filename = custom_filename
+
+    # Now train the CNN for this specific difficulty
+    print(f"\n=== Training CNN for {difficulty} ===")
+    
+    try:
+        # Set training parameters based on difficulty
+        if difficulty == "Beginner":
+            max_games = 5000
+            epochs = 40
+        elif difficulty == "Intermediate":
+            max_games = 10000
+            epochs = 60
+        else:  # Expert
+            max_games = 20000
+            epochs = 80
+        
+        # Train the model
+        model = trainer.train(difficulty, max_games=max_games, epochs=epochs)
+        
+        if model:
+            model_filename = f"minesweeper_cnn_{difficulty.lower()}_{max_games}.keras"
+            print(f"✓ Training completed for {difficulty}")
+            print(f"✓ Model saved as: {model_filename}")
+        else:
+            print(f"✗ Training failed for {difficulty}")
+            
+    except Exception as e:
+        print(f"✗ Error training {difficulty}: {e}")
+
+    print("\n" + "=" * 50)
+    print(f"Training Summary for {difficulty}:")
+    print(f"- Maps file: {filename}")
+    print(f"- Model file: minesweeper_cnn_{difficulty.lower()}_{max_games}.keras")
+    print("- Use TrainedCNNStrategy to play with trained model")
+    print("=" * 50)
+
+
+def train_all_difficulties():
+    """Train CNN models for all difficulties with separate map files"""
+    
+    trainer = CNNTrainer()
+    benchmark = StrategyBenchmark()
+    difficulties = ["Intermediate", "Expert"]
+    training_params = {
+        "Beginner": {"max_games": 5000, "epochs": 40, "map_count": 5000},
+        "Intermediate": {"max_games": 1000, "epochs": 60, "map_count": 1000},
+        "Expert": {"max_games": 2000, "epochs": 80, "map_count": 2000}
+    }
+    
+    print("=== Auto-generating maps and training CNNs for all difficulties ===")
+    
+    for difficulty in difficulties:
+        print(f"\n{'='*20} {difficulty} {'='*20}")
+        
+        params = training_params[difficulty]
+        filename = f"minefields.json"
+        
+        try:
+            # Generate maps for this difficulty
+            print(f"Generating {params['map_count']} maps for {difficulty}...")
+            
+           
+            benchmark.prepare_maps(difficulty, params['map_count'], seed=None)
+            benchmark.generator.save_maps(filename)
+            print(f"✓ Maps saved to {filename}")
+            
+            # Train the model
+            print(f"Training CNN for {difficulty}...")
+            print(f"Parameters: {params['max_games']} games, {params['epochs']} epochs")
+            
+            model = trainer.train(difficulty, max_games=params['max_games'], epochs=params['epochs'])
+            
+            if model:
+                model_filename = f"minesweeper_cnn_{difficulty.lower()}_{params['max_games']}.keras"
+                print(f"✓ Training completed for {difficulty}")
+                print(f"✓ Model saved as: {model_filename}")
+            else:
+                print(f"✗ Training failed for {difficulty}")
+                
+        except Exception as e:
+            print(f"✗ Error with {difficulty}: {e}")
+            continue
+
+    print("\n" + "=" * 60)
+    print("Final Summary:")
+    print("Generated files:")
+    for difficulty in difficulties:
+        params = training_params[difficulty]
+        print(f"  - minefields_{difficulty.lower()}.json")
+        print(f"  - minesweeper_cnn_{difficulty.lower()}_{params['max_games']}.keras")
+    print("\nUse TrainedCNNStrategy to play with any of the trained models")
+    print("=" * 60)
+
 
 
 class Settings:
@@ -3819,3 +4373,4 @@ def main():
 if __name__ == "__main__":
     main()
     #train_cnn_from_minefields()
+    #train_all_difficulties()    
